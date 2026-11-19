@@ -1,12 +1,15 @@
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from apply_spy.cli import main
 from apply_spy.db import Profile, make_engine, session_scope
 from apply_spy.profiles import (
+    ConfirmationRequired,
     DuplicateProfileName,
     InvalidProfileName,
+    ProfileNotFound,
     create_profile,
+    delete_profile,
     get_active_profile,
     list_profiles,
 )
@@ -116,3 +119,86 @@ def test_active_profile_is_none_when_there_are_no_profiles(engine):
     with session_scope(engine) as session:
         assert get_active_profile(session, None) is None
         assert get_active_profile(session, 1) is None
+
+
+def _make_two_profiles_with_owned_rows(engine):
+    """Two profiles plus a stand-in table that, like real tables, has a profile_id.
+
+    (Real tables such as applications arrive in later stories.)
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE sample_owned (id INTEGER PRIMARY KEY, "
+                "profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE)"
+            )
+        )
+    with session_scope(engine) as session:
+        one = create_profile(session, "Sample One").id
+        two = create_profile(session, "Sample Two").id
+    with engine.begin() as conn:
+        for profile_id in (one, one, two):
+            conn.execute(
+                text("INSERT INTO sample_owned (profile_id) VALUES (:p)"), {"p": profile_id}
+            )
+    return one, two
+
+
+def test_delete_profile_removes_it_and_its_data_but_not_the_other_profiles(engine):
+    one, two = _make_two_profiles_with_owned_rows(engine)
+
+    with session_scope(engine) as session:
+        delete_profile(session, one, confirmed=True)
+
+    with session_scope(engine) as session:
+        assert [p.id for p in list_profiles(session)] == [two]
+    with engine.connect() as conn:
+        owners = conn.execute(text("SELECT profile_id FROM sample_owned")).scalars().all()
+        assert owners == [two]
+        assert conn.execute(text("PRAGMA foreign_key_check")).all() == []  # no orphans
+
+
+@pytest.mark.parametrize("confirmed", [False, None, "yes", 1])
+def test_delete_without_explicit_confirmation_changes_nothing(engine, confirmed):
+    one, _two = _make_two_profiles_with_owned_rows(engine)
+
+    with pytest.raises(ConfirmationRequired):
+        with session_scope(engine) as session:
+            delete_profile(session, one, confirmed)
+
+    with session_scope(engine) as session:
+        assert len(list_profiles(session)) == 2
+    with engine.connect() as conn:
+        assert len(conn.execute(text("SELECT * FROM sample_owned")).all()) == 3
+
+
+def test_delete_unknown_profile_is_an_error(engine):
+    with pytest.raises(ProfileNotFound):
+        with session_scope(engine) as session:
+            delete_profile(session, 999, confirmed=True)
+
+
+def test_deleting_the_active_profile_falls_back_to_the_remaining_one(engine):
+    with session_scope(engine) as session:
+        one = create_profile(session, "Sample One").id
+        two = create_profile(session, "Sample Two").id
+    with session_scope(engine) as session:
+        delete_profile(session, one, confirmed=True)
+    with session_scope(engine) as session:
+        assert get_active_profile(session, one).id == two
+
+
+def test_cli_delete_needs_a_yes(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("APPLY_SPY_DATA_DIR", str(tmp_path))
+    assert main(["profile", "add", "Haruka"]) == 0
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "no")
+    assert main(["profile", "delete", "1"]) == 1  # cancelled
+    assert main(["profile", "list"]) == 0
+    assert capsys.readouterr().out.strip().splitlines()[-1].endswith("Haruka")
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
+    assert main(["profile", "delete", "1"]) == 0
+    assert main(["profile", "delete", "1"]) == 1  # already gone
+    with session_scope(make_engine()) as session:
+        assert session.scalars(select(Profile)).all() == []
