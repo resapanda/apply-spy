@@ -1,5 +1,7 @@
 # Personal data: never commit
 data/
+# Old data that 'restore' moves aside instead of deleting
+data.before-restore-*/
 
 # Python
 __pycache__/

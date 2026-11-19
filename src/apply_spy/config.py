@@ -3,6 +3,8 @@
 import os
 from pathlib import Path
 
+DATABASE_FILENAME = "apply_spy.db"
+
 
 def data_dir() -> Path:
     """Folder for the database and resume files (gitignored).
@@ -16,4 +18,4 @@ def data_dir() -> Path:
 
 
 def database_url() -> str:
-    return f"sqlite:///{data_dir() / 'apply_spy.db'}"
+    return f"sqlite:///{data_dir() / DATABASE_FILENAME}"
