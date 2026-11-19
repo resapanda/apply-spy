@@ -10,7 +10,7 @@ from datetime import date
 from nicegui import ui
 
 from apply_spy.db import session_scope
-from apply_spy.tracker import needs_attention
+from apply_spy.tracker import count_follow_ups
 from apply_spy.ui.dialogs import add_application_dialog, add_follow_up_dialog, confirm_quit
 from apply_spy.ui.state import ActiveProfile, engine, load_active_profile, set_active_profile
 from apply_spy.ui.theme import apply_colors, icon
@@ -29,26 +29,28 @@ class Shell:
     """What a page gets from the frame."""
 
     profile: ActiveProfile
-    refresh_badge: Callable[[], None]  # call after follow-ups change, to update the sidebar
+    refresh_badge: Callable[[], None]  # call after follow-ups change, to update the badge
 
     @property
     def profile_id(self) -> int | None:
         return self.profile.id
 
 
-def _urgent_count(profile_id: int | None) -> int:
-    """How many follow-ups need action now (overdue plus due today)."""
+def _follow_up_count(profile_id: int | None) -> int:
+    """How many open follow-ups there are: the same number the Follow-ups page lists."""
     if profile_id is None:
         return 0
     with session_scope(engine) as session:
-        return needs_attention(session, profile_id).urgent
+        return count_follow_ups(session, profile_id)
 
 
-def _nav_html(active: str, urgent: int) -> str:
+def _nav_html(active: str, follow_ups: int) -> str:
     links = []
     for key, label, icon_name, href in NAV:
         badge = (
-            f'<span class="as-nav-badge">{urgent}</span>' if key == "follow-ups" and urgent else ""
+            f'<span class="as-nav-badge">{follow_ups}</span>'
+            if key == "follow-ups" and follow_ups
+            else ""
         )
         links.append(
             f'<a href="{href}" class="{"active" if key == active else ""}" '
@@ -97,7 +99,7 @@ def app_shell(active: str) -> Iterator[Shell]:
 
         @ui.refreshable
         def navigation() -> None:
-            ui.html(_nav_html(active, _urgent_count(profile.id)), sanitize=False)
+            ui.html(_nav_html(active, _follow_up_count(profile.id)), sanitize=False)
 
         navigation()
         ui.html('<div class="as-section-label">Quick Actions</div>', sanitize=False)

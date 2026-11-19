@@ -19,6 +19,7 @@ from apply_spy.tracker import (
     change_status,
     complete_follow_up,
     count_completed_follow_ups,
+    count_follow_ups,
     create_application,
     export_applications_csv,
     later_follow_ups,
@@ -1413,16 +1414,37 @@ def test_deleting_a_profile_removes_its_completed_follow_ups_only(engine, two_pr
         assert conn.execute(text("PRAGMA foreign_key_check")).all() == []  # no orphans
 
 
-def test_the_sidebar_badge_counts_overdue_plus_due_today(engine, two_profiles):
-    one, _ = two_profiles
+def test_the_follow_up_count_matches_everything_the_follow_ups_page_lists(engine, two_profiles):
+    one, two = two_profiles
     with session_scope(engine) as session:
         _add(session, one, "Late Co", -3)
         _add(session, one, "Today Co", 0)
         _add(session, one, "Soon Co", 4)
+        _add(session, one, "Far Co", 40)
+        _add(session, one, "Closed Co", 2, status="Rejected")  # closed: not counted
+        create_application(session, one, "No Date Co", "Engineer")  # no follow-up: not counted
+        _add(session, two, "Other Profile Co", 1)  # someone else's: not counted
+
     with session_scope(engine) as session:
-        found = needs_attention(session, one, today=TODAY)
-    assert found.urgent == 2  # this-week items are not urgent
-    assert found.total == 3
+        listed = needs_attention(session, one, today=TODAY)
+        on_the_page = listed.total + len(later_follow_ups(session, one, today=TODAY))
+        assert count_follow_ups(session, one) == on_the_page == 4
+        assert count_follow_ups(session, two) == 1
+
+
+def test_the_follow_up_count_drops_when_one_is_completed_and_returns_on_undo(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = _add(session, one, "Acme", 2).id
+        _add(session, one, "Globex", 50)
+    with session_scope(engine) as session:
+        assert count_follow_ups(session, one) == 2
+        record_id = complete_follow_up(session, one, app_id).id
+    with session_scope(engine) as session:
+        assert count_follow_ups(session, one) == 1
+        undo_complete_follow_up(session, one, record_id)
+    with session_scope(engine) as session:
+        assert count_follow_ups(session, one) == 2
 
 
 # --- Upcoming and later follow-ups ---------------------------------------------------

@@ -332,11 +332,6 @@ class NeedsAttention:
     def total(self) -> int:
         return len(self.overdue) + len(self.due_today) + len(self.this_week)
 
-    @property
-    def urgent(self) -> int:
-        """How many need action now: overdue plus due today (the sidebar badge)."""
-        return len(self.overdue) + len(self.due_today)
-
 
 def needs_attention(session: Session, profile_id: int, today: date | None = None) -> NeedsAttention:
     """This profile's follow-ups that are overdue, due today, or due within 7 days.
@@ -418,6 +413,24 @@ def calendar_month(
         weeks=[
             [CalendarDay(d, d.month == month, by_day.get(d, [])) for d in week] for week in weeks
         ],
+    )
+
+
+def count_follow_ups(session: Session, profile_id: int) -> int:
+    """How many open follow-ups this profile has, however far away: exactly the ones the
+    Follow-ups page lists (overdue, today, this week and later). Closed applications
+    are left out, as everywhere. This is the number on the sidebar badge."""
+    return (
+        session.scalar(
+            select(func.count())
+            .select_from(Application)
+            .where(
+                Application.profile_id == profile_id,
+                Application.follow_up_date.is_not(None),
+                Application.status.not_in(CLOSED_STATUSES),
+            )
+        )
+        or 0
     )
 
 

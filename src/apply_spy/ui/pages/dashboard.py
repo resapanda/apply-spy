@@ -10,6 +10,7 @@ from apply_spy.db import session_scope
 from apply_spy.tracker import (
     calendar_month,
     count_completed_follow_ups,
+    later_follow_ups,
     list_applications,
     list_completed_follow_ups,
     needs_attention,
@@ -138,9 +139,12 @@ def _build(shell: Shell) -> None:
     def overview() -> None:
         with session_scope(engine) as session:
             found = needs_attention(session, profile_id)
+            later = later_follow_ups(session, profile_id)
             completed_count = count_completed_follow_ups(session, profile_id)
             completed = list_completed_follow_ups(session, profile_id, limit=20)
             recent = list_applications(session, profile_id, limit=8)
+        # Everything the Follow-ups tab lists (and the sidebar badge counts).
+        open_follow_ups = found.total + len(later)
 
         actions.undo_bar()
 
@@ -154,8 +158,8 @@ def _build(shell: Shell) -> None:
             with ui.tab("followups", label="Follow-ups", icon="event_available").props(
                 "data-testid=tab-followups"
             ):
-                if found.urgent:
-                    ui.badge(str(found.urgent), color="primary").classes("ml-2")
+                if open_follow_ups:
+                    ui.badge(str(open_follow_ups), color="primary").classes("ml-2")
             ui.tab("applications", label="Applications", icon="description").props(
                 "data-testid=tab-applications"
             )
@@ -164,7 +168,7 @@ def _build(shell: Shell) -> None:
 
         with ui.tab_panels(tabs, value=state["tab"]).classes("w-full bg-transparent"):
             with ui.tab_panel("followups").classes("p-0 gap-4"):
-                if found.total == 0:
+                if open_follow_ups == 0:
                     with (
                         ui.element("div").classes("as-card as-empty").props("data-testid=all-clear")
                     ):
@@ -177,6 +181,7 @@ def _build(shell: Shell) -> None:
                     ("Overdue", "red", "schedule", "overdue", found.overdue),
                     ("Today", "amber", "event", "today", found.due_today),
                     ("This Week", "blue", "date_range", "this-week", found.this_week),
+                    ("Later", "blue", "update", "later", later),
                 ):
                     if apps:
                         ui.html(
