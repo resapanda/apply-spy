@@ -7,6 +7,7 @@ from apply_spy.profiles import (
     DuplicateProfileName,
     InvalidProfileName,
     create_profile,
+    get_active_profile,
     list_profiles,
 )
 
@@ -87,3 +88,31 @@ def test_cli_add_and_list(tmp_path, monkeypatch, capsys):
     assert (tmp_path / "apply_spy.db").exists()
     with session_scope(make_engine()) as session:
         assert len(session.scalars(select(Profile)).all()) == 1
+
+
+def test_active_profile_is_the_one_picked(engine):
+    with session_scope(engine) as session:
+        first = create_profile(session, "Sample One")
+        second = create_profile(session, "Sample Two")
+        first_id, second_id = first.id, second.id
+
+    with session_scope(engine) as session:
+        assert get_active_profile(session, second_id).id == second_id
+        assert get_active_profile(session, first_id).id == first_id
+
+
+def test_active_profile_falls_back_to_first_when_unset_or_missing(engine):
+    with session_scope(engine) as session:
+        first = create_profile(session, "Sample One")
+        create_profile(session, "Sample Two")
+        first_id = first.id
+
+    with session_scope(engine) as session:
+        assert get_active_profile(session, None).id == first_id
+        assert get_active_profile(session, 9999).id == first_id
+
+
+def test_active_profile_is_none_when_there_are_no_profiles(engine):
+    with session_scope(engine) as session:
+        assert get_active_profile(session, None) is None
+        assert get_active_profile(session, 1) is None
