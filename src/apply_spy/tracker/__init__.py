@@ -12,6 +12,7 @@ from apply_spy.tracker.service import (
     get_application,
     list_applications,
     list_status_events,
+    set_follow_up,
     update_application_details,
 )
 
@@ -29,5 +30,6 @@ __all__ = [
     "get_application",
     "list_applications",
     "list_status_events",
+    "set_follow_up",
     "update_application_details",
 ]

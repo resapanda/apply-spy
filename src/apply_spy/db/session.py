@@ -3,7 +3,7 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Engine, create_engine, event, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from apply_spy.config import database_url
@@ -21,9 +21,39 @@ def make_engine(url: str | None = None) -> Engine:
     return engine
 
 
+def _add_missing_columns(engine: Engine) -> None:
+    """Add columns that newer versions of the tables have but an older database lacks.
+
+    create_all only creates missing tables, so without this an existing database
+    would break when a column is added to a model. Only nullable columns can be
+    added this way (existing rows get an empty value); anything bigger needs a
+    real migration.
+    """
+    existing_tables = set(inspect(engine).get_table_names())
+    with engine.begin() as connection:
+        for table in Base.metadata.sorted_tables:
+            if table.name not in existing_tables:
+                continue
+            have = {column["name"] for column in inspect(connection).get_columns(table.name)}
+            for column in table.columns:
+                if column.name in have:
+                    continue
+                if not column.nullable:
+                    raise RuntimeError(
+                        f"Cannot add required column {table.name}.{column.name} to an "
+                        "existing table automatically; this change needs a real migration."
+                    )
+                column_type = column.type.compile(dialect=engine.dialect)
+                # Names come from our own models, never from user input.
+                connection.execute(
+                    text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {column_type}')
+                )
+
+
 def init_db(engine: Engine) -> None:
-    """Create any missing tables. (Real migrations come when the schema needs them.)"""
+    """Create any missing tables and add any missing (nullable) columns."""
     Base.metadata.create_all(engine)
+    _add_missing_columns(engine)
 
 
 @contextmanager

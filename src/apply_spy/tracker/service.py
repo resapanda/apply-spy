@@ -6,6 +6,7 @@ that profile's rows.
 
 import csv
 import io
+import re
 from datetime import date
 
 from sqlalchemy import case, func, select
@@ -34,6 +35,7 @@ SORT_FIELDS = ("created", "date_applied", "company", "status")
 MAX_SHORT = 200
 MAX_URL = 2000
 MAX_SALARY = 100
+MAX_FOLLOW_UP_LABEL = 100
 
 # Fields that can be changed later with update_application_details.
 # Everything except status, which must go through change_status so history is written.
@@ -101,6 +103,25 @@ def _url(value: str | None) -> str | None:
 def _notes(value: str | None) -> str | None:
     cleaned = (value or "").strip()
     return cleaned or None
+
+
+def _follow_up_date(value: date | str | None) -> date | None:
+    """A date, or text in the form 2026-11-30. Empty means no date. Anything else is rejected."""
+    if value is None or isinstance(value, date):
+        return value
+    text = value.strip()
+    if not text:
+        return None
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        raise InvalidApplication(
+            "follow-up date", "Follow-up date must look like 2026-11-30 (year-month-day)."
+        )
+    try:
+        return date.fromisoformat(text)
+    except ValueError as error:
+        raise InvalidApplication(
+            "follow-up date", f"{text} is not a real date. Use the form 2026-11-30."
+        ) from error
 
 
 def create_application(
@@ -178,6 +199,30 @@ def update_application_details(
 
     for name, value in cleaned.items():
         setattr(application, name, value)
+    session.flush()
+    return application
+
+
+def set_follow_up(
+    session: Session,
+    profile_id: int,
+    application_id: int,
+    follow_up_date: date | str | None,
+    label: str | None = None,
+) -> Application:
+    """Set (or clear) the follow-up date and its optional label, e.g. "OA due".
+
+    Passing no date clears the follow-up and its label. A label needs a date.
+    The date can be a date or text like 2026-11-30; anything else is rejected
+    with a message, and nothing is changed.
+    """
+    parsed = _follow_up_date(follow_up_date)
+    cleaned_label = _optional("Label", "follow-up label", label, MAX_FOLLOW_UP_LABEL)
+    if parsed is None and cleaned_label is not None:
+        raise InvalidApplication("follow-up date", "Pick a follow-up date for this label.")
+    application = get_application(session, profile_id, application_id)
+    application.follow_up_date = parsed
+    application.follow_up_label = cleaned_label
     session.flush()
     return application
 
@@ -288,6 +333,8 @@ EXPORT_COLUMNS = (
     ("Resume version", "resume_version"),
     ("Status", "status"),
     ("Date applied", "date_applied"),
+    ("Follow-up date", "follow_up_date"),
+    ("Follow-up label", "follow_up_label"),
     ("Notes", "notes"),
     ("Added", "created_at"),
 )

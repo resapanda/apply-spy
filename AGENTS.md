@@ -15,7 +15,7 @@ Work items live in GitHub Issues (one per user story, grouped by sprint mileston
 
 ## Current status
 
-Sprint 1 (v0.1) in progress. Done: profiles (1.1-1.3), the application tracker (2.1-2.3: quick-add, status changes with history, editing, filters, search, sort, table and board views), CSV export (3.1) and backup and restore (3.2). Still to do in Sprint 1: follow-up reminders (4.1, 4.2). Update this section as the project moves.
+Sprint 1 (v0.1) in progress. Done: profiles (1.1-1.3), the application tracker (2.1-2.3: quick-add, status changes with history, editing, filters, search, sort, table and board views), CSV export (3.1), backup and restore (3.2) and follow-up dates (4.1). Still to do in Sprint 1: the "Needs attention" page (4.2). Databases made by older versions get new nullable columns added automatically by `init_db` (see `db/session.py`); anything bigger needs a real migration. Update this section as the project moves.
 
 ## Decisions already made (do not re-ask)
 
