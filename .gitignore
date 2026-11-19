@@ -1,0 +1,17 @@
+# Personal data: never commit
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+
+# NiceGUI
+.nicegui/
+
+# OS / editor
+.DS_Store
