@@ -84,7 +84,12 @@ def test_backup_manifest_records_row_counts(tmp_path):
     archive, _ = create_backup(data)
     with zipfile.ZipFile(archive) as zf:
         manifest = json.loads(zf.read("manifest.json"))
-    assert manifest["counts"] == {"profiles": 2, "applications": 3, "status_events": 4}
+    assert manifest["counts"] == {
+        "profiles": 2,
+        "applications": 3,
+        "status_events": 4,
+        "completed_follow_ups": 0,
+    }
     assert manifest["resume_files"] == 2
 
 
@@ -151,7 +156,12 @@ def test_restore_into_an_empty_folder_brings_back_everything(tmp_path):
     assert set(before) == {"Sample One", "Sample Two"}
     assert (fresh / "resumes" / "sample_resume.pdf").read_bytes() == b"%PDF made-up bytes \x00\xff"
     assert (fresh / "resumes" / "sub" / "v2.txt").read_text(encoding="utf-8") == "made-up resume"
-    assert result.counts == {"profiles": 2, "applications": 3, "status_events": 4}
+    assert result.counts == {
+        "profiles": 2,
+        "applications": 3,
+        "status_events": 4,
+        "completed_follow_ups": 0,
+    }
 
 
 def test_self_check_after_restore_reports_the_same_row_counts_as_before(tmp_path):
@@ -314,7 +324,12 @@ def test_check_reports_counts_and_health(tmp_path):
     data = make_data_folder(tmp_path / "data")
     result = check_database(data / "apply_spy.db")
     assert result.ok
-    assert result.counts == {"profiles": 2, "applications": 3, "status_events": 4}
+    assert result.counts == {
+        "profiles": 2,
+        "applications": 3,
+        "status_events": 4,
+        "completed_follow_ups": 0,
+    }
 
 
 def test_check_flags_a_missing_table(tmp_path):
@@ -417,3 +432,88 @@ def test_a_restore_leaves_the_housekeeping_files_where_they_are(tmp_path):
     assert set(read_everything(target)) == {"Sample One", "Sample Two"}
     [kept] = [p for p in tmp_path.iterdir() if p.name.startswith("target.before-restore-")]
     assert not (kept / ".nicegui").exists()  # the old *data* moved aside, not these files
+
+
+# --- Backups made before a table existed still restore ------------------------------
+
+
+def test_a_backup_from_before_a_table_existed_still_restores(tmp_path):
+    import json as _json
+
+    source = make_data_folder(tmp_path / "old-source")
+    with sqlite3.connect(source / "apply_spy.db") as conn:
+        conn.execute("DROP TABLE completed_follow_ups")
+    # create_backup refuses a DB with a missing table, so build the old-style archive by hand,
+    # exactly as an older version would have: database + a manifest without the new table.
+    archive = tmp_path / "old.zip"
+    counts = check_database(source / "apply_spy.db").counts
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("manifest.json", _json.dumps({"format_version": 1, "counts": counts}))
+        zf.write(source / "apply_spy.db", "apply_spy.db")
+    assert "completed_follow_ups" not in counts
+
+    fresh = tmp_path / "fresh"
+    result = restore_backup(archive, fresh)
+
+    assert result.counts == counts
+    assert set(read_everything_after_upgrade(fresh)) == {"Sample One", "Sample Two"}
+
+
+def read_everything_after_upgrade(folder):
+    """Open the restored data the way the app does (which creates any newer tables)."""
+    engine = make_engine(f"sqlite:///{folder / 'apply_spy.db'}")
+    try:
+        init_db(engine)
+        with engine.connect() as conn:
+            tables = {r[0] for r in conn.execute(sqlite3_master_names())}
+        assert "completed_follow_ups" in tables  # the new table appeared
+    finally:
+        engine.dispose()
+    return read_everything(folder)
+
+
+def sqlite3_master_names():
+    from sqlalchemy import text
+
+    return text("SELECT name FROM sqlite_master WHERE type = 'table'")
+
+
+def test_a_table_the_manifest_lists_must_really_be_in_the_backup(tmp_path):
+    import json as _json
+
+    source = make_data_folder(tmp_path / "src")
+    counts = check_database(source / "apply_spy.db").counts
+    with sqlite3.connect(source / "apply_spy.db") as conn:
+        conn.execute("DROP TABLE completed_follow_ups")  # gone from the DB, but still promised
+    archive = tmp_path / "broken.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("manifest.json", _json.dumps({"format_version": 1, "counts": counts}))
+        zf.write(source / "apply_spy.db", "apply_spy.db")
+
+    with pytest.raises(InvalidBackup):
+        restore_backup(archive, tmp_path / "target")
+
+
+def test_check_and_backup_bring_an_older_database_up_to_date_first(tmp_path, monkeypatch, capsys):
+    data = make_data_folder(tmp_path / "data")
+    with sqlite3.connect(data / "apply_spy.db") as conn:
+        conn.execute("DROP TABLE completed_follow_ups")  # a database from before the table
+    monkeypatch.setenv("APPLY_SPY_DATA_DIR", str(data))
+
+    assert main(["check"]) == 0  # not "MISSING table"
+    out = capsys.readouterr().out
+    assert "completed_follow_ups: 0" in out and "MISSING" not in out
+
+    with sqlite3.connect(data / "apply_spy.db") as conn:
+        conn.execute("DROP TABLE completed_follow_ups")
+    assert main(["backup", "--output", str(tmp_path / "saved")]) == 0  # the backup is current
+    [archive] = (tmp_path / "saved").glob("*.zip")
+    with zipfile.ZipFile(archive) as zf:
+        assert "completed_follow_ups" in json.loads(zf.read("manifest.json"))["counts"]
+
+
+def test_check_without_a_database_still_says_so_and_creates_nothing(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("APPLY_SPY_DATA_DIR", str(tmp_path / "empty"))
+    assert main(["check"]) == 1
+    assert "No database found" in capsys.readouterr().out
+    assert not (tmp_path / "empty" / "apply_spy.db").exists()

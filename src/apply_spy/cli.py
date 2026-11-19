@@ -122,9 +122,23 @@ def _print_counts(counts: dict[str, int]) -> None:
         print(f"  {table}: {count}")
 
 
+def _upgrade_existing_database(folder: Path) -> None:
+    """Bring a database made by an older version up to date (adds newer tables and
+    columns). Does nothing if there is no database yet, so a first backup or check
+    still reports "no database" instead of quietly creating an empty one."""
+    if (folder / DATABASE_FILENAME).exists():
+        engine = make_engine()
+        try:
+            init_db(engine)
+        finally:
+            engine.dispose()
+
+
 def _data_command(args) -> int:
     folder = data_dir()
     try:
+        if args.command in ("backup", "check"):
+            _upgrade_existing_database(folder)
         if args.command == "backup":
             output = Path(args.output) if args.output else None
             archive, result = create_backup(folder, output)

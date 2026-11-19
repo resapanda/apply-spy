@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
-from apply_spy.db.models import Application, Profile, StatusEvent
+from apply_spy.db.models import Application, CompletedFollowUp, Profile, StatusEvent
 from apply_spy.profiles import ProfileNotFound
 
 STATUSES = (
@@ -72,6 +72,10 @@ class ApplicationNotFound(LookupError):
 
 class InvalidStatus(ValueError):
     """The status is not one of STATUSES."""
+
+
+class CompletedFollowUpNotFound(LookupError):
+    """No completed follow-up with this id in this profile."""
 
 
 def _short_text(value: str | None) -> str | None:
@@ -236,18 +240,78 @@ def set_follow_up(
 
 def complete_follow_up(
     session: Session, profile_id: int, application_id: int
-) -> tuple[date | None, str | None]:
-    """Mark an application's follow-up as done: it is cleared, so it leaves the
-    dashboard and calendar. Returns the date and label it had, so the caller can
-    offer Undo (by passing them back to set_follow_up). Nothing to clear is not an
-    error; it returns (None, None).
+) -> CompletedFollowUp | None:
+    """Mark an application's follow-up as done.
+
+    The follow-up is cleared (so it leaves the dashboard and calendar) and a record of
+    it is kept in the completed list. Returns that record, so the caller can offer
+    Undo (see undo_complete_follow_up). Nothing to complete is not an error: it
+    returns None and changes nothing.
     """
     application = get_application(session, profile_id, application_id)
-    previous = (application.follow_up_date, application.follow_up_label)
+    if application.follow_up_date is None:
+        return None
+    record = CompletedFollowUp(
+        application_id=application.id,
+        due_date=application.follow_up_date,
+        label=application.follow_up_label,
+    )
+    session.add(record)
     application.follow_up_date = None
     application.follow_up_label = None
     session.flush()
-    return previous
+    return record
+
+
+def undo_complete_follow_up(session: Session, profile_id: int, completed_id: int) -> Application:
+    """Put a completed follow-up back: it returns to the application and leaves the
+    completed list. If the application has been given a new follow-up since, nothing
+    is changed and an error explains why."""
+    record = session.scalar(
+        select(CompletedFollowUp)
+        .join(Application, CompletedFollowUp.application_id == Application.id)
+        .where(CompletedFollowUp.id == completed_id, Application.profile_id == profile_id)
+    )
+    if record is None:
+        raise CompletedFollowUpNotFound(f"No completed follow-up with id {completed_id}.")
+    application = record.application
+    if application.follow_up_date is not None:
+        raise InvalidApplication(
+            "follow-up date",
+            "This application already has a new follow-up, so the old one was not restored.",
+        )
+    application.follow_up_date = record.due_date
+    application.follow_up_label = record.label
+    session.delete(record)
+    session.flush()
+    return application
+
+
+def list_completed_follow_ups(
+    session: Session, profile_id: int, limit: int | None = None
+) -> list[CompletedFollowUp]:
+    """This profile's completed follow-ups, most recently completed first."""
+    query = (
+        select(CompletedFollowUp)
+        .join(Application, CompletedFollowUp.application_id == Application.id)
+        .where(Application.profile_id == profile_id)
+        .order_by(CompletedFollowUp.completed_at.desc(), CompletedFollowUp.id.desc())
+    )
+    if limit is not None:
+        query = query.limit(limit)
+    return list(session.scalars(query).unique())
+
+
+def count_completed_follow_ups(session: Session, profile_id: int) -> int:
+    return (
+        session.scalar(
+            select(func.count())
+            .select_from(CompletedFollowUp)
+            .join(Application, CompletedFollowUp.application_id == Application.id)
+            .where(Application.profile_id == profile_id)
+        )
+        or 0
+    )
 
 
 def _today() -> date:
@@ -267,6 +331,11 @@ class NeedsAttention:
     @property
     def total(self) -> int:
         return len(self.overdue) + len(self.due_today) + len(self.this_week)
+
+    @property
+    def urgent(self) -> int:
+        """How many need action now: overdue plus due today (the sidebar badge)."""
+        return len(self.overdue) + len(self.due_today)
 
 
 def needs_attention(session: Session, profile_id: int, today: date | None = None) -> NeedsAttention:
@@ -349,6 +418,46 @@ def calendar_month(
         weeks=[
             [CalendarDay(d, d.month == month, by_day.get(d, [])) for d in week] for week in weeks
         ],
+    )
+
+
+def upcoming_follow_ups(
+    session: Session, profile_id: int, today: date | None = None, limit: int = 5
+) -> list[Application]:
+    """The next follow-ups from today onwards, soonest first (the dashboard's
+    'Upcoming Follow-ups' list). Closed applications are left out."""
+    today = today or _today()
+    return list(
+        session.scalars(
+            select(Application)
+            .where(
+                Application.profile_id == profile_id,
+                Application.follow_up_date.is_not(None),
+                Application.follow_up_date >= today,
+                Application.status.not_in(CLOSED_STATUSES),
+            )
+            .order_by(Application.follow_up_date, func.lower(Application.company), Application.id)
+            .limit(limit)
+        )
+    )
+
+
+def later_follow_ups(
+    session: Session, profile_id: int, today: date | None = None
+) -> list[Application]:
+    """Follow-ups further away than the 'this week' window, soonest first."""
+    today = today or _today()
+    return list(
+        session.scalars(
+            select(Application)
+            .where(
+                Application.profile_id == profile_id,
+                Application.follow_up_date.is_not(None),
+                Application.follow_up_date > today + timedelta(days=ATTENTION_DAYS_AHEAD),
+                Application.status.not_in(CLOSED_STATUSES),
+            )
+            .order_by(Application.follow_up_date, func.lower(Application.company), Application.id)
+        )
     )
 
 
