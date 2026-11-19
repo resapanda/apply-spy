@@ -4,10 +4,12 @@ Profile isolation: every function takes a profile_id and only ever touches
 that profile's rows.
 """
 
+import calendar
 import csv
 import io
 import re
-from datetime import date
+from dataclasses import dataclass, field
+from datetime import date, timedelta
 
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
@@ -28,6 +30,11 @@ STATUSES = (
     "Ghosted",
 )
 DEFAULT_STATUS = "Applied"
+
+# Nothing more to do on these, so their follow-ups are not shown as needing attention.
+CLOSED_STATUSES = ("Accepted", "Rejected", "Withdrawn")
+# "This week" means tomorrow up to this many days ahead.
+ATTENTION_DAYS_AHEAD = 7
 
 # "created" is when the application was added; the others are what you see in the table.
 SORT_FIELDS = ("created", "date_applied", "company", "status")
@@ -225,6 +232,124 @@ def set_follow_up(
     application.follow_up_label = cleaned_label
     session.flush()
     return application
+
+
+def complete_follow_up(
+    session: Session, profile_id: int, application_id: int
+) -> tuple[date | None, str | None]:
+    """Mark an application's follow-up as done: it is cleared, so it leaves the
+    dashboard and calendar. Returns the date and label it had, so the caller can
+    offer Undo (by passing them back to set_follow_up). Nothing to clear is not an
+    error; it returns (None, None).
+    """
+    application = get_application(session, profile_id, application_id)
+    previous = (application.follow_up_date, application.follow_up_label)
+    application.follow_up_date = None
+    application.follow_up_label = None
+    session.flush()
+    return previous
+
+
+def _today() -> date:
+    """The computer's local date. A separate function so tests can fix the clock."""
+    return date.today()
+
+
+@dataclass
+class NeedsAttention:
+    """Follow-ups grouped by urgency, each group ordered soonest first."""
+
+    today: date
+    overdue: list[Application] = field(default_factory=list)  # before today
+    due_today: list[Application] = field(default_factory=list)
+    this_week: list[Application] = field(default_factory=list)  # tomorrow .. 7 days ahead
+
+    @property
+    def total(self) -> int:
+        return len(self.overdue) + len(self.due_today) + len(self.this_week)
+
+
+def needs_attention(session: Session, profile_id: int, today: date | None = None) -> NeedsAttention:
+    """This profile's follow-ups that are overdue, due today, or due within 7 days.
+
+    Uses the computer's local date unless `today` is given (tests pass a fixed
+    date). Follow-ups further away are left out, and so are applications that are
+    closed (Accepted, Rejected, Withdrawn).
+    """
+    today = today or _today()
+    last_day = today + timedelta(days=ATTENTION_DAYS_AHEAD)
+    found = session.scalars(
+        select(Application)
+        .where(
+            Application.profile_id == profile_id,
+            Application.follow_up_date.is_not(None),
+            Application.follow_up_date <= last_day,
+            Application.status.not_in(CLOSED_STATUSES),
+        )
+        .order_by(Application.follow_up_date, func.lower(Application.company), Application.id)
+    )
+    groups = NeedsAttention(today=today)
+    for application in found:
+        if application.follow_up_date < today:
+            groups.overdue.append(application)
+        elif application.follow_up_date == today:
+            groups.due_today.append(application)
+        else:
+            groups.this_week.append(application)
+    return groups
+
+
+@dataclass
+class CalendarDay:
+    day: date
+    in_month: bool  # False for the grey days that fill the first and last week
+    applications: list[Application] = field(default_factory=list)  # follow-ups due this day
+
+
+@dataclass
+class CalendarMonth:
+    year: int
+    month: int
+    today: date
+    weeks: list[list[CalendarDay]]  # whole weeks, Sunday first
+
+
+def calendar_month(
+    session: Session, profile_id: int, year: int, month: int, today: date | None = None
+) -> CalendarMonth:
+    """A month grid with each day's follow-ups, for the dashboard calendar.
+
+    Weeks run Sunday to Saturday and are whole, so the first and last rows include
+    days of the neighbouring months (marked in_month=False) and their follow-ups too.
+    Closed applications (Accepted, Rejected, Withdrawn) are left out, as on the
+    Needs attention lists. Each day's applications are ordered by company.
+    """
+    if not 1 <= month <= 12:
+        raise ValueError(f"Month must be 1 to 12, not {month}.")
+    weeks = calendar.Calendar(firstweekday=calendar.SUNDAY).monthdatescalendar(year, month)
+    first, last = weeks[0][0], weeks[-1][-1]
+    found = session.scalars(
+        select(Application)
+        .where(
+            Application.profile_id == profile_id,
+            Application.follow_up_date.is_not(None),
+            Application.follow_up_date >= first,
+            Application.follow_up_date <= last,
+            Application.status.not_in(CLOSED_STATUSES),
+        )
+        .order_by(func.lower(Application.company), Application.id)
+    )
+    by_day: dict[date, list[Application]] = {}
+    for application in found:
+        by_day.setdefault(application.follow_up_date, []).append(application)
+    return CalendarMonth(
+        year=year,
+        month=month,
+        today=today or _today(),
+        weeks=[
+            [CalendarDay(d, d.month == month, by_day.get(d, [])) for d in week] for week in weeks
+        ],
+    )
 
 
 def list_applications(

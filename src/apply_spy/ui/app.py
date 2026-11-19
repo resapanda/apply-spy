@@ -1,5 +1,6 @@
 """Local web UI (NiceGUI). No business logic here: it calls the service layer."""
 
+import calendar
 import html
 import json
 import re
@@ -26,12 +27,15 @@ from apply_spy.tracker import (
     ApplicationNotFound,
     InvalidApplication,
     InvalidStatus,
+    calendar_month,
     change_status,
+    complete_follow_up,
     create_application,
     export_applications_csv,
     get_application,
     list_applications,
     list_status_events,
+    needs_attention,
     set_follow_up,
     update_application_details,
 )
@@ -61,7 +65,8 @@ def page_layout():
     with ui.header().classes("items-center justify-between"):
         with ui.row().classes("items-center gap-4"):
             ui.label("apply-spy").classes("text-xl font-bold")
-            ui.link("Applications", "/").classes("text-white")
+            ui.link("Dashboard", "/").classes("text-white")
+            ui.link("Applications", "/applications").classes("text-white")
             ui.link("Profiles", "/profiles").classes("text-white")
             ui.link("Data", "/data").classes("text-white")
         if profiles:
@@ -74,6 +79,12 @@ def page_layout():
 
 
 @ui.page("/")
+def dashboard_page() -> None:
+    with page_layout() as active_id:
+        _dashboard_content(active_id)
+
+
+@ui.page("/applications")
 def applications_page() -> None:
     with page_layout() as active_id:
         _applications_content(active_id)
@@ -125,6 +136,259 @@ def _current_filters() -> dict:
     saved["search"] = str(saved["search"] or "")
     saved["descending"] = bool(saved["descending"])
     return saved
+
+
+def _days_text(days: int) -> str:
+    """How far a follow-up is from today, in words."""
+    if days < 0:
+        return f"{-days} day{'s' if days != -1 else ''} overdue"
+    if days == 0:
+        return "Today"
+    return f"in {days} day{'s' if days != 1 else ''}"
+
+
+def _calendar_html(month) -> str:
+    """The month grid as one HTML block. All text is escaped; the only links go to our
+    own detail pages. Chips are coloured like the tiles: overdue red, today yellow,
+    later blue."""
+    chips_per_day = 3
+    cells = [
+        f'<div style="font-weight:600;font-size:.85em;text-align:center;opacity:.7">{name}</div>'
+        for name in ("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
+    ]
+    for week in month.weeks:
+        for cell in week:
+            is_today = cell.day == month.today
+            colour = (
+                "rgba(193,0,21,.22)"
+                if cell.day < month.today
+                else "rgba(242,192,55,.4)"
+                if is_today
+                else "rgba(25,118,210,.22)"
+            )
+            chips = "".join(
+                f'<a href="/applications/{int(a.id)}" title="{html.escape(a.company)}'
+                f'{": " + html.escape(a.follow_up_label) if a.follow_up_label else ""}" '
+                f'style="display:block;font-size:.72em;padding:1px 3px;margin-top:2px;'
+                f"border-radius:4px;background:{colour};white-space:nowrap;overflow:hidden;"
+                f'text-overflow:ellipsis;text-decoration:none;color:inherit">'
+                f"{html.escape(a.company)}"
+                f"{' · ' + html.escape(a.follow_up_label) if a.follow_up_label else ''}</a>"
+                for a in cell.applications[:chips_per_day]
+            )
+            extra = len(cell.applications) - chips_per_day
+            more = (
+                f'<div style="font-size:.75em;opacity:.7">+{extra} more</div>' if extra > 0 else ""
+            )
+            border = "2px solid #1976d2" if is_today else "1px solid rgba(128,128,128,.35)"
+            dim = "" if cell.in_month else "opacity:.45;"
+            cells.append(
+                f'<div style="min-height:72px;padding:3px;min-width:0;border:{border};'
+                f'border-radius:6px;{dim}">'
+                f'<div style="font-size:.85em;{"font-weight:700;" if is_today else ""}">'
+                f"{cell.day.day}</div>{chips}{more}</div>"
+            )
+    return (
+        '<div data-testid="calendar" style="overflow-x:auto"><div style="display:grid;'
+        f'grid-template-columns:repeat(7,minmax(0,1fr));gap:3px">{"".join(cells)}</div></div>'
+    )
+
+
+def _dashboard_content(profile_id: int | None) -> None:
+    """The home page: what needs attention first. Insights (funnel, weekly activity)
+    are planned for later and will be added here."""
+    ui.label("Dashboard").classes("text-2xl font-bold mt-4")
+    if profile_id is None:
+        ui.label("Create a profile first, then add applications.")
+        ui.link("Go to Profiles", "/profiles")
+        return
+
+    columns = [
+        {"name": "due", "label": "Follow-up", "field": "due", "align": "left"},
+        {"name": "label", "label": "Label", "field": "label", "align": "left"},
+        {"name": "company", "label": "Company", "field": "company", "align": "left"},
+        {"name": "title", "label": "Title", "field": "title", "align": "left"},
+        {"name": "status", "label": "Status", "field": "status", "align": "left"},
+        {"name": "action", "label": "", "field": "id", "align": "left"},
+    ]
+
+    def open_follow_up(event) -> None:
+        application_id = event.args.get("id") if isinstance(event.args, dict) else None
+        if isinstance(application_id, int):
+            _follow_up_dialog(profile_id, application_id, refresh_all)
+
+    last_done: dict = {"item": None}  # the most recent Done, kept so it can be undone
+
+    def mark_done(event) -> None:
+        """Clear the follow-up in one click and remember it for Undo."""
+        application_id = event.args.get("id") if isinstance(event.args, dict) else None
+        if not isinstance(application_id, int):
+            return
+        try:
+            with session_scope(engine) as session:
+                application = get_application(session, profile_id, application_id)
+                company = application.company
+                previous_date, previous_label = complete_follow_up(
+                    session, profile_id, application_id
+                )
+        except ApplicationNotFound as error:
+            ui.notify(str(error), type="negative")
+            return
+        last_done["item"] = {
+            "id": application_id,
+            "company": company,
+            "date": previous_date,
+            "label": previous_label,
+        }
+        refresh_all()
+
+    def undo_done() -> None:
+        item = last_done["item"]
+        last_done["item"] = None
+        if item is not None:
+            try:
+                with session_scope(engine) as session:
+                    set_follow_up(session, profile_id, item["id"], item["date"], item["label"])
+            except (InvalidApplication, ApplicationNotFound) as error:
+                ui.notify(str(error), type="negative")
+        refresh_all()
+
+    def dismiss_done() -> None:
+        last_done["item"] = None
+        attention.refresh()
+
+    def section(title: str, color: str, applications, today) -> None:
+        ui.label(f"{title} ({len(applications)})").classes(f"text-lg font-bold mt-4 {color}")
+        rows = [
+            {
+                "id": a.id,
+                "due": f"{a.follow_up_date.isoformat()} · "
+                f"{_days_text((a.follow_up_date - today).days)}",
+                "label": a.follow_up_label or "",
+                "company": a.company,
+                "title": a.title,
+                "status": a.status,
+            }
+            for a in applications
+        ]
+        grid = (
+            ui.table(columns=columns, rows=rows, row_key="id", pagination=25)
+            .classes("w-full")
+            .props(f"data-testid=section-{title.lower().replace(' ', '-')}")
+        )
+        grid.add_slot(
+            "body-cell-company",
+            '<q-td :props="props"><a :href="\'/applications/\' + props.row.id" '
+            'class="text-primary" style="text-decoration: underline">'
+            "{{ props.value }}</a></q-td>",
+        )
+        grid.add_slot(
+            "body-cell-action",
+            '<q-td :props="props">'
+            '<q-btn flat dense round size="sm" color="positive" icon="check_circle" '
+            'title="Done: clear this follow-up" '
+            "@click=\"() => $parent.$emit('follow_up_done', {id: props.row.id})\" />"
+            '<q-btn flat dense round size="sm" icon="event" '
+            'title="Change or clear the follow-up" '
+            "@click=\"() => $parent.$emit('follow_up', {id: props.row.id})\" />"
+            "</q-td>",
+        )
+        grid.on("follow_up", open_follow_up)
+        grid.on("follow_up_done", mark_done)
+
+    @ui.refreshable
+    def attention() -> None:
+        with session_scope(engine) as session:
+            found = needs_attention(session, profile_id)
+        groups = [
+            ("Overdue", "text-negative", found.overdue),
+            ("Today", "text-warning", found.due_today),
+            ("This week", "text-primary", found.this_week),
+        ]
+        done = last_done["item"]
+        if done is not None:
+            with (
+                ui.row()
+                .classes("items-center gap-2 p-2 rounded")
+                .style("background: rgba(46,125,50,.18)")
+                .props("data-testid=undo-bar")
+            ):
+                ui.icon("check_circle", color="positive")
+                was = _follow_up_text(done["date"], done["label"]) or "no date"
+                ui.label(f"Done: {done['company']} (was {was})")
+                ui.button("Undo", on_click=undo_done).props("flat dense")
+                ui.button(icon="close", on_click=dismiss_done).props("flat dense round")
+        ui.label(f"Today is {found.today.strftime('%A')}, {found.today.isoformat()}").classes(
+            "text-sm opacity-70"
+        )
+        with ui.row().classes("gap-4 mt-2"):
+            for title, color, apps in groups:
+                with (
+                    ui.card()
+                    .classes("w-40 items-center")
+                    .props(f"data-testid=tile-{title.lower().replace(' ', '-')}")
+                ):
+                    ui.label(str(len(apps))).classes(f"text-4xl font-bold {color}")
+                    ui.label(title).classes("text-sm opacity-70")
+        if found.total == 0:
+            ui.label("Nothing needs your attention right now.").classes("text-lg mt-6").props(
+                "data-testid=all-clear"
+            )
+            ui.label(
+                "Set a follow-up date on an application and it shows up here when it is "
+                "due within a week."
+            ).classes("opacity-70")
+            ui.link("Go to Applications", "/applications")
+            return
+        for title, color, apps in groups:
+            if apps:
+                section(title, color, apps, found.today)
+
+    shown = {"year": date.today().year, "month": date.today().month}
+
+    def shift(months: int) -> None:
+        index = shown["year"] * 12 + (shown["month"] - 1) + months
+        shown["year"], shown["month"] = index // 12, index % 12 + 1
+        month_view.refresh()
+
+    def go_to_today() -> None:
+        shown["year"], shown["month"] = date.today().year, date.today().month
+        month_view.refresh()
+
+    @ui.refreshable
+    def month_view() -> None:
+        with session_scope(engine) as session:
+            month = calendar_month(session, profile_id, shown["year"], shown["month"])
+        with ui.row().classes("items-center gap-2"):
+            ui.button(icon="chevron_left", on_click=lambda: shift(-1)).props(
+                "flat round dense data-testid=calendar-previous"
+            )
+            ui.label(f"{calendar.month_name[month.month]} {month.year}").classes(
+                "text-lg font-bold w-48 text-center"
+            ).props("data-testid=calendar-title")
+            ui.button(icon="chevron_right", on_click=lambda: shift(1)).props(
+                "flat round dense data-testid=calendar-next"
+            )
+            ui.button("Today", on_click=go_to_today).props("flat dense")
+        ui.html(_calendar_html(month), sanitize=False)
+
+    def refresh_all() -> None:
+        attention.refresh()
+        month_view.refresh()
+
+    # Two columns: what needs attention on the left, the calendar on the right.
+    # On a narrow window the calendar wraps underneath.
+    with ui.row().classes("w-full items-start gap-8").props("data-testid=dashboard-layout"):
+        with ui.column().style("flex: 1 1 520px; min-width: 0"):
+            attention()
+        with (
+            ui.column().style("flex: 0 0 440px; max-width: 100%").props("data-testid=calendar-side")
+        ):
+            ui.label("Calendar").classes("text-lg font-bold")
+            ui.label("Follow-up dates. Click one to open the application.").classes(
+                "text-sm opacity-70"
+            )
+            month_view()
 
 
 def _follow_up_text(follow_up_date, label) -> str:
@@ -435,7 +699,7 @@ def _applications_content(profile_id: int | None) -> None:
 
 
 def _application_detail_content(profile_id: int | None, application_id: int) -> None:
-    ui.link("< Back to applications", "/")
+    ui.link("< Back to applications", "/applications")
     if profile_id is None:
         ui.label("Create a profile first.")
         return
