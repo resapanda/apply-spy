@@ -9,7 +9,7 @@ import csv
 import io
 import re
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
@@ -471,7 +471,12 @@ _FORMULA_STARTS = ("=", "+", "-", "@", "\t", "\r")
 def _csv_cell(value) -> str:
     if value is None:
         return ""
-    text = value.isoformat() if hasattr(value, "isoformat") else str(value)
+    if isinstance(value, datetime):
+        text = value.isoformat(timespec="seconds")  # e.g. 2026-11-19T01:19:16+00:00 (UTC)
+    elif isinstance(value, date):
+        text = value.isoformat()
+    else:
+        text = str(value)
     if text.startswith(_FORMULA_STARTS):
         return "'" + text  # shown as plain text instead of being run as a formula
     return text

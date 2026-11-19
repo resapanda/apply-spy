@@ -6,12 +6,34 @@ data stays separate (see AGENTS.md, "Profile isolation").
 
 from datetime import UTC, date, datetime
 
-from sqlalchemy import Date, DateTime, ForeignKey, Index, String, Text, func
+from sqlalchemy import Date, DateTime, ForeignKey, Index, String, Text, TypeDecorator, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
     pass
+
+
+class UTCDateTime(TypeDecorator):
+    """A timestamp that is always UTC.
+
+    SQLite keeps the time but forgets the time zone, so values would come back as plain
+    "naive" times that look like local time. This puts UTC back when reading, so every
+    timestamp the app sees says what zone it is in. The stored data does not change.
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is not None and value.tzinfo is not None:
+            value = value.astimezone(UTC)
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is not None and value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value
 
 
 class Profile(Base):
@@ -20,7 +42,7 @@ class Profile(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+        UTCDateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
     def __repr__(self) -> str:
@@ -53,7 +75,7 @@ class Application(Base):
     follow_up_date: Mapped[date | None] = mapped_column(Date)
     follow_up_label: Mapped[str | None] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+        UTCDateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
 
@@ -69,5 +91,5 @@ class StatusEvent(Base):
     old_status: Mapped[str | None] = mapped_column(String(50))
     new_status: Mapped[str] = mapped_column(String(50))
     changed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+        UTCDateTime(timezone=True), default=lambda: datetime.now(UTC)
     )

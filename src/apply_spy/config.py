@@ -1,6 +1,7 @@
 """Where apply-spy keeps its local data."""
 
 import os
+import secrets
 from pathlib import Path
 
 DATABASE_FILENAME = "apply_spy.db"
@@ -43,3 +44,42 @@ def data_dir() -> Path:
 
 def database_url() -> str:
     return f"sqlite:///{data_dir() / DATABASE_FILENAME}"
+
+
+def _read_secret(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, UnicodeDecodeError):
+        return ""
+
+
+def session_secret() -> str:
+    """The secret that signs the browser cookie remembering your active profile.
+
+    Made randomly the first time and kept in the data folder (readable only by you), so
+    the cookie stays valid across restarts. An empty or damaged file is replaced. Losing
+    the file only makes the browser forget its remembered choices; no data is affected.
+    """
+    path = data_dir() / NICEGUI_DIRNAME / "session-secret"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _read_secret(path)
+    if existing:
+        return existing
+
+    # Write a complete private file under a temporary name, then put it in place in one
+    # step, so nobody can ever see a half-written secret.
+    candidate = secrets.token_urlsafe(32)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(candidate)
+        try:
+            os.link(temporary, path)  # only succeeds if no file is there yet
+        except FileExistsError:
+            if not _read_secret(path):  # a leftover empty/damaged file: replace it
+                os.replace(temporary, path)
+            # otherwise another start won the race; use its secret below
+    finally:
+        temporary.unlink(missing_ok=True)
+    return _read_secret(path) or candidate

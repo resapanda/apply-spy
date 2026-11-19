@@ -5,12 +5,12 @@ import html
 import json
 import re
 from contextlib import contextmanager
-from datetime import UTC, date
+from datetime import date
 
 from nicegui import app, ui
 
 from apply_spy.backup import BackupError, check_database, create_backup
-from apply_spy.config import DATABASE_FILENAME, PORT, data_dir
+from apply_spy.config import DATABASE_FILENAME, PORT, data_dir, session_secret
 from apply_spy.db import init_db, make_engine, session_scope
 from apply_spy.profiles import (
     ConfirmationRequired,
@@ -797,6 +797,12 @@ def _application_detail_content(profile_id: int | None, application_id: int) -> 
         notes = ui.textarea("Notes", value=application.notes or "").classes("w-full")
 
         def save() -> None:
+            # The calendar picker could hand back nothing; the service then rejects it with
+            # a clear message instead of this raising an unhandled error.
+            try:
+                applied = date.fromisoformat(date_input.value) if date_input.value else None
+            except ValueError:
+                applied = None
             try:
                 with session_scope(engine) as session:
                     updated = update_application_details(
@@ -810,7 +816,7 @@ def _application_detail_content(profile_id: int | None, application_id: int) -> 
                         salary_range=salary.value,
                         resume_version=resume.value,
                         notes=notes.value,
-                        date_applied=date.fromisoformat(date_input.value),
+                        date_applied=applied,
                     )
                     heading_text = f"{updated.company}: {updated.title}"
             except (InvalidApplication, ApplicationNotFound) as error:
@@ -829,7 +835,7 @@ def _application_detail_content(profile_id: int | None, application_id: int) -> 
         rows = [
             {
                 "id": e.id,
-                "when": e.changed_at.replace(tzinfo=UTC).astimezone().strftime("%Y-%m-%d %H:%M"),
+                "when": e.changed_at.astimezone().strftime("%Y-%m-%d %H:%M"),
                 "old": e.old_status,
                 "new": e.new_status,
             }
@@ -987,12 +993,12 @@ def _profiles_content() -> None:
 def run() -> None:
     # host=127.0.0.1: only this computer can reach the app (your data stays private).
     # storage_secret signs the cookie that remembers the active profile in this browser.
-    # It protects nothing sensitive: the app is only reachable from this computer.
+    # It is generated once and kept in the data folder, so it survives restarts.
     ui.run(
         title="apply-spy",
         host="127.0.0.1",
         port=PORT,
         reload=False,
         show=True,
-        storage_secret="apply-spy-local",
+        storage_secret=session_secret(),
     )

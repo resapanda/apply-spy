@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from apply_spy import config
 
 
@@ -53,3 +55,59 @@ def test_the_cli_does_not_import_nicegui_before_serve_sets_its_storage_folder():
         check=True,
     )
     assert result.stdout.strip() == "False"
+
+
+# --- The session secret ------------------------------------------------------------
+
+
+def test_the_session_secret_is_random_private_and_kept_between_starts(tmp_path, monkeypatch):
+    import stat
+
+    monkeypatch.setenv("APPLY_SPY_DATA_DIR", str(tmp_path / "data"))
+    first = config.session_secret()
+    second = config.session_secret()  # a restart: same secret, so the cookie stays valid
+
+    assert first == second
+    assert len(first) >= 40 and first != "apply-spy-local"
+    path = tmp_path / "data" / ".nicegui" / "session-secret"
+    assert path.read_text(encoding="utf-8") == first
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600  # readable only by you
+
+
+def test_each_data_folder_gets_its_own_secret(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPLY_SPY_DATA_DIR", str(tmp_path / "one"))
+    one = config.session_secret()
+    monkeypatch.setenv("APPLY_SPY_DATA_DIR", str(tmp_path / "two"))
+    assert config.session_secret() != one
+
+
+def test_starting_twice_at_the_same_moment_agrees_on_one_secret(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setenv("APPLY_SPY_DATA_DIR", str(tmp_path / "data"))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        secrets_seen = set(pool.map(lambda _: config.session_secret(), range(40)))
+    assert len(secrets_seen) == 1
+
+
+def test_an_empty_secret_file_is_replaced_not_used(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPLY_SPY_DATA_DIR", str(tmp_path / "data"))
+    path = tmp_path / "data" / ".nicegui" / "session-secret"
+    path.parent.mkdir(parents=True)
+    path.write_text("", encoding="utf-8")
+    assert config.session_secret() != ""
+
+
+@pytest.mark.parametrize("damaged", [b"", b"   \n", b"\xff\xfe\x00 not text"])
+def test_a_damaged_secret_file_is_replaced_and_never_hangs_the_app(tmp_path, monkeypatch, damaged):
+    monkeypatch.setenv("APPLY_SPY_DATA_DIR", str(tmp_path / "data"))
+    path = tmp_path / "data" / ".nicegui" / "session-secret"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(damaged)
+
+    secret = config.session_secret()
+
+    assert len(secret) >= 40
+    assert path.read_text(encoding="utf-8") == secret  # fixed on disk, so it stays stable
+    assert config.session_secret() == secret
+    assert [p.name for p in path.parent.iterdir()] == ["session-secret"]  # no temp leftovers

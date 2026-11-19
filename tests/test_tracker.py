@@ -1,7 +1,7 @@
 import csv
 import io
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 from sqlalchemy import select, text
@@ -1202,3 +1202,82 @@ def test_cannot_complete_another_profiles_follow_up(engine, two_profiles):
             complete_follow_up(session, two, app_id)
     with session_scope(engine) as session:
         assert _names(needs_attention(session, one, today=TODAY).overdue) == ["One Co"]
+
+
+# --- The applied date can never be blanked (detail-page Save guard) -------------
+
+
+@pytest.mark.parametrize("bad", [None, "", "2026-11-01"])
+def test_the_applied_date_cannot_be_cleared_or_replaced_by_text(engine, two_profiles, bad):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(
+            session, one, "Acme", "Engineer", date_applied=date(2026, 11, 1)
+        ).id
+
+    with pytest.raises(InvalidApplication) as error:
+        with session_scope(engine) as session:
+            update_application_details(session, one, app_id, company="New Name", date_applied=bad)
+
+    assert error.value.field == "date applied"
+    assert "Date applied" in str(error.value)
+    with session_scope(engine) as session:  # nothing was changed, not even the company
+        [app] = list_applications(session, one)
+    assert (app.company, app.date_applied) == ("Acme", date(2026, 11, 1))
+
+
+# --- Timestamps always say they are UTC ------------------------------------------
+
+
+def test_timestamps_come_back_with_their_time_zone(engine, two_profiles):
+    from datetime import UTC
+
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+
+    with session_scope(engine) as session:
+        [app] = list_applications(session, one)
+        [event] = list_status_events(session, one, app_id)
+    assert app.created_at.tzinfo is not None and app.created_at.utcoffset().total_seconds() == 0
+    assert event.changed_at.tzinfo is not None
+    assert abs((datetime.now(UTC) - app.created_at).total_seconds()) < 60  # and it is "now"
+
+
+def test_old_rows_stored_without_a_zone_also_come_back_as_utc(engine, two_profiles):
+    from datetime import UTC
+
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        create_application(session, one, "Acme", "Engineer")
+    with engine.begin() as conn:  # the way older versions stored it: a plain time, no zone
+        conn.execute(text("UPDATE applications SET created_at = '2026-11-19 01:19:16.540099'"))
+
+    with session_scope(engine) as session:
+        [app] = list_applications(session, one)
+    assert app.created_at == datetime(2026, 11, 19, 1, 19, 16, 540099, tzinfo=UTC)
+
+
+def test_the_csv_export_marks_the_added_column_as_utc_without_microseconds(engine, two_profiles):
+    from datetime import UTC
+
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        create_application(session, one, "Acme", "Engineer")
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE applications SET created_at = '2026-11-19 01:19:16.540099'"))
+
+    with session_scope(engine) as session:
+        rows = _read_csv(export_applications_csv(session, one))
+    added = dict(zip(rows[0], rows[1], strict=True))["Added"]
+    assert added == "2026-11-19T01:19:16+00:00"
+    assert datetime.fromisoformat(added) == datetime(2026, 11, 19, 1, 19, 16, tzinfo=UTC)
+
+
+def test_the_date_applied_column_is_still_a_plain_date_in_the_export(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        create_application(session, one, "Acme", "Engineer", date_applied=date(2026, 11, 1))
+    with session_scope(engine) as session:
+        rows = _read_csv(export_applications_csv(session, one))
+    assert dict(zip(rows[0], rows[1], strict=True))["Date applied"] == "2026-11-01"
