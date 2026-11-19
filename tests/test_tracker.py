@@ -14,11 +14,14 @@ from apply_spy.tracker import (
     ApplicationNotFound,
     InvalidApplication,
     InvalidStatus,
+    calendar_month,
     change_status,
+    complete_follow_up,
     create_application,
     export_applications_csv,
     list_applications,
     list_status_events,
+    needs_attention,
     set_follow_up,
     update_application_details,
 )
@@ -849,3 +852,353 @@ def test_init_db_adds_the_follow_up_columns_to_an_older_database(tmp_path):
             assert list_applications(session, 1)[0].follow_up_label == "OA due"
     finally:
         engine.dispose()
+
+
+# --- Needs attention (story 4.2) --------------------------------------------
+
+TODAY = date(2026, 11, 19)
+
+
+def _add(session, profile_id, company, days_from_today, status=None, today=TODAY):
+    app = create_application(session, profile_id, company, "Engineer")
+    set_follow_up(session, profile_id, app.id, today + timedelta(days=days_from_today), "Check in")
+    if status:
+        change_status(session, profile_id, app.id, status)
+    return app
+
+
+def _names(apps):
+    return [a.company for a in apps]
+
+
+def test_follow_ups_are_grouped_into_overdue_today_and_this_week(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        _add(session, one, "Yesterday Co", -1)
+        _add(session, one, "Today Co", 0)
+        _add(session, one, "Soon Co", 3)
+        _add(session, one, "Far Co", 30)  # a month away: not listed
+        create_application(session, one, "No Date Co", "Engineer")  # no follow-up: not listed
+
+    with session_scope(engine) as session:
+        result = needs_attention(session, one, today=TODAY)
+    assert _names(result.overdue) == ["Yesterday Co"]
+    assert _names(result.due_today) == ["Today Co"]
+    assert _names(result.this_week) == ["Soon Co"]
+    assert result.total == 3
+    assert result.today == TODAY
+
+
+def test_week_boundaries(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        _add(session, one, "Tomorrow", 1)
+        _add(session, one, "Day Seven", 7)
+        _add(session, one, "Day Eight", 8)
+
+    with session_scope(engine) as session:
+        result = needs_attention(session, one, today=TODAY)
+    assert _names(result.this_week) == ["Tomorrow", "Day Seven"]  # day 8 is left out
+
+
+def test_each_group_is_ordered_soonest_first(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        _add(session, one, "Two Days Late", -2)
+        _add(session, one, "Ten Days Late", -10)
+        _add(session, one, "Five Days Ahead", 5)
+        _add(session, one, "Two Days Ahead", 2)
+        _add(session, one, "beta", 0)
+        _add(session, one, "Alpha", 0)
+
+    with session_scope(engine) as session:
+        result = needs_attention(session, one, today=TODAY)
+    assert _names(result.overdue) == ["Ten Days Late", "Two Days Late"]  # most overdue first
+    assert _names(result.this_week) == ["Two Days Ahead", "Five Days Ahead"]
+    assert _names(result.due_today) == ["Alpha", "beta"]  # same day: by company, ignoring case
+
+
+def test_closed_applications_are_not_listed(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        for status in ("Accepted", "Rejected", "Withdrawn"):
+            _add(session, one, f"{status} Co", -1, status=status)
+        _add(session, one, "Interview Co", -1, status="Interview")
+        _add(session, one, "Ghosted Co", -1, status="Ghosted")  # still worth a nudge
+
+    with session_scope(engine) as session:
+        result = needs_attention(session, one, today=TODAY)
+    assert set(_names(result.overdue)) == {"Interview Co", "Ghosted Co"}
+
+
+def test_needs_attention_only_shows_that_profiles_applications(engine, two_profiles):
+    one, two = two_profiles
+    with session_scope(engine) as session:
+        _add(session, one, "One Co", -1)
+        _add(session, two, "Two Co", -1)
+
+    with session_scope(engine) as session:
+        assert _names(needs_attention(session, one, today=TODAY).overdue) == ["One Co"]
+        assert _names(needs_attention(session, two, today=TODAY).overdue) == ["Two Co"]
+
+
+def test_nothing_needs_attention_when_there_are_no_follow_ups(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        create_application(session, one, "Acme", "Engineer")
+    with session_scope(engine) as session:
+        assert needs_attention(session, one, today=TODAY).total == 0
+
+
+def test_grouping_follows_the_date_around_midnight(engine, two_profiles):
+    """The same follow-up moves from 'this week' to 'today' to 'overdue' as the date
+    changes. The clock is fixed by passing the date, so this never depends on when
+    the test runs."""
+    one, _ = two_profiles
+    nov_20 = date(2026, 11, 20)
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+        set_follow_up(session, one, app_id, nov_20, "OA due")
+
+    def group_on(day):
+        with session_scope(engine) as session:
+            result = needs_attention(session, one, today=day)
+        return (
+            "overdue"
+            if result.overdue
+            else "today"
+            if result.due_today
+            else "week"
+            if result.this_week
+            else "none"
+        )
+
+    assert group_on(date(2026, 11, 19)) == "week"  # 23:59 the night before
+    assert group_on(date(2026, 11, 20)) == "today"  # one minute later
+    assert group_on(date(2026, 11, 21)) == "overdue"  # the next midnight
+    assert group_on(date(2026, 11, 12)) == "none"  # 8 days ahead: not yet
+
+
+def test_default_clock_is_the_computers_local_date(engine, two_profiles, monkeypatch):
+    from apply_spy.tracker import service
+
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        _add(session, one, "Acme", 0)  # due on TODAY
+
+    monkeypatch.setattr(service, "_today", lambda: TODAY)
+    with session_scope(engine) as session:
+        assert _names(needs_attention(session, one).due_today) == ["Acme"]
+    monkeypatch.setattr(service, "_today", lambda: TODAY + timedelta(days=1))
+    with session_scope(engine) as session:
+        assert _names(needs_attention(session, one).overdue) == ["Acme"]
+
+
+def test_the_default_clock_really_is_local_today():
+    from apply_spy.tracker import service
+
+    assert service._today() == date.today()
+
+
+def test_needs_attention_with_1000_applications_is_fast(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        for i in range(1000):
+            app = create_application(session, one, f"Company {i % 50}", f"Engineer {i}")
+            set_follow_up(session, one, app.id, TODAY + timedelta(days=(i % 40) - 10), "Check in")
+
+    started = time.perf_counter()
+    with session_scope(engine) as session:
+        result = needs_attention(session, one, today=TODAY)
+    elapsed = time.perf_counter() - started
+
+    assert result.total == sum(1 for i in range(1000) if (i % 40) - 10 <= 7)
+    assert elapsed < 1.0
+
+
+# --- Calendar (dashboard) ------------------------------------------------------
+
+
+def _follow_up_on(session, profile_id, company, day, status=None):
+    app = create_application(session, profile_id, company, "Engineer")
+    set_follow_up(session, profile_id, app.id, day, "Check in")
+    if status:
+        change_status(session, profile_id, app.id, status)
+    return app
+
+
+def _days(month):
+    return [d for week in month.weeks for d in week]
+
+
+def test_calendar_is_made_of_whole_weeks_starting_on_sunday(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        month = calendar_month(session, one, 2026, 10, today=TODAY)  # Oct 1, 2026 is a Thursday
+
+    assert all(len(week) == 7 for week in month.weeks)
+    assert month.weeks[0][0].day == date(2026, 9, 27)  # the Sunday before Oct 1
+    assert month.weeks[-1][-1].day == date(2026, 10, 31)  # Oct 31, 2026 is a Saturday
+    assert all(week[0].day.weekday() == 6 for week in month.weeks)  # 6 = Sunday
+    days = _days(month)
+    assert [d.day for d in days] == sorted(d.day for d in days)  # in date order, no gaps
+    assert all(b.day - a.day == timedelta(days=1) for a, b in zip(days, days[1:], strict=False))
+
+
+def test_calendar_marks_which_days_belong_to_the_month(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        month = calendar_month(session, one, 2026, 10, today=TODAY)
+    inside = [d.day for d in _days(month) if d.in_month]
+    assert inside[0] == date(2026, 10, 1) and inside[-1] == date(2026, 10, 31)
+    assert len(inside) == 31
+    assert not any(d.in_month for d in month.weeks[0] if d.day.month == 9)
+
+
+def test_calendar_puts_follow_ups_on_their_day(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        _follow_up_on(session, one, "Acme", date(2026, 11, 5))
+        _follow_up_on(session, one, "beta", date(2026, 11, 5))
+        _follow_up_on(session, one, "Globex", date(2026, 11, 30))
+
+    with session_scope(engine) as session:
+        month = calendar_month(session, one, 2026, 11, today=TODAY)
+    by_day = {d.day: [a.company for a in d.applications] for d in _days(month) if d.applications}
+    assert by_day == {date(2026, 11, 5): ["Acme", "beta"], date(2026, 11, 30): ["Globex"]}
+
+
+def test_calendar_shows_neighbouring_month_follow_ups_in_the_grey_days(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        _follow_up_on(session, one, "Early Dec", date(2026, 12, 2))  # in November's last week
+        _follow_up_on(session, one, "Mid Dec", date(2026, 12, 20))  # not in the grid at all
+
+    with session_scope(engine) as session:
+        month = calendar_month(session, one, 2026, 11, today=TODAY)
+    shown = {d.day: d for d in _days(month) if d.applications}
+    assert list(shown) == [date(2026, 12, 2)]
+    assert shown[date(2026, 12, 2)].in_month is False
+
+
+def test_calendar_leaves_out_closed_applications_and_other_profiles(engine, two_profiles):
+    one, two = two_profiles
+    with session_scope(engine) as session:
+        _follow_up_on(session, one, "Open Co", date(2026, 11, 10))
+        _follow_up_on(session, one, "Rejected Co", date(2026, 11, 10), status="Rejected")
+        _follow_up_on(session, two, "Other Profile Co", date(2026, 11, 10))
+
+    with session_scope(engine) as session:
+        month = calendar_month(session, one, 2026, 11, today=TODAY)
+    [day] = [d for d in _days(month) if d.applications]
+    assert [a.company for a in day.applications] == ["Open Co"]
+
+
+@pytest.mark.parametrize(
+    ("year", "month", "first_sunday", "weeks"),
+    [
+        (2026, 12, date(2026, 11, 29), 5),  # December spills back into November
+        (2027, 1, date(2026, 12, 27), 6),  # starts in the previous year; Jan 31 is a Sunday
+        (2028, 2, date(2028, 1, 30), 5),  # a leap February (29 days)
+        (2026, 2, date(2026, 2, 1), 4),  # a February that fits in exactly 4 weeks
+    ],
+)
+def test_calendar_handles_year_and_month_boundaries(
+    engine, two_profiles, year, month, first_sunday, weeks
+):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        result = calendar_month(session, one, year, month, today=TODAY)
+    assert result.weeks[0][0].day == first_sunday
+    assert len(result.weeks) == weeks
+    assert (result.year, result.month) == (year, month)
+
+
+def test_calendar_rejects_a_month_that_does_not_exist(engine, two_profiles):
+    one, _ = two_profiles
+    for bad in (0, 13, -1):
+        with pytest.raises(ValueError):
+            with session_scope(engine) as session:
+                calendar_month(session, one, 2026, bad)
+
+
+def test_calendar_today_follows_the_clock(engine, two_profiles, monkeypatch):
+    from apply_spy.tracker import service
+
+    one, _ = two_profiles
+    monkeypatch.setattr(service, "_today", lambda: date(2026, 11, 19))
+    with session_scope(engine) as session:
+        assert calendar_month(session, one, 2026, 11).today == date(2026, 11, 19)
+
+
+# --- Completing a follow-up ------------------------------------------------------
+
+
+def test_completing_a_follow_up_clears_it_and_it_leaves_the_dashboard_and_calendar(
+    engine, two_profiles
+):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app = _add(session, one, "Acme", -1)
+        app_id = app.id
+        _add(session, one, "Globex", 0)
+
+    with session_scope(engine) as session:
+        complete_follow_up(session, one, app_id)
+
+    with session_scope(engine) as session:
+        assert _names(needs_attention(session, one, today=TODAY).overdue) == []
+        assert _names(needs_attention(session, one, today=TODAY).due_today) == ["Globex"]
+        month = calendar_month(session, one, 2026, 11, today=TODAY)
+        assert [a.company for d in _days(month) for a in d.applications] == ["Globex"]
+        acme = next(a for a in list_applications(session, one) if a.company == "Acme")
+        assert (acme.follow_up_date, acme.follow_up_label) == (None, None)
+
+
+def test_completing_returns_the_old_values_so_undo_works(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = _add(session, one, "Acme", -1).id
+
+    with session_scope(engine) as session:
+        previous_date, previous_label = complete_follow_up(session, one, app_id)
+    assert (previous_date, previous_label) == (TODAY - timedelta(days=1), "Check in")
+
+    with session_scope(engine) as session:  # Undo
+        set_follow_up(session, one, app_id, previous_date, previous_label)
+    with session_scope(engine) as session:
+        assert _names(needs_attention(session, one, today=TODAY).overdue) == ["Acme"]
+
+
+def test_completing_does_not_touch_status_history_or_other_details(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = _add(session, one, "Acme", -1, status="Interview").id
+        update_application_details(session, one, app_id, notes="Keep this")
+
+    with session_scope(engine) as session:
+        complete_follow_up(session, one, app_id)
+
+    with session_scope(engine) as session:
+        [app] = list_applications(session, one)
+        assert (app.status, app.notes) == ("Interview", "Keep this")
+        assert len(list_status_events(session, one, app_id)) == 2
+
+
+def test_completing_with_nothing_to_clear_is_harmless(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+    with session_scope(engine) as session:
+        assert complete_follow_up(session, one, app_id) == (None, None)
+
+
+def test_cannot_complete_another_profiles_follow_up(engine, two_profiles):
+    one, two = two_profiles
+    with session_scope(engine) as session:
+        app_id = _add(session, one, "One Co", -1).id
+    with pytest.raises(ApplicationNotFound):
+        with session_scope(engine) as session:
+            complete_follow_up(session, two, app_id)
+    with session_scope(engine) as session:
+        assert _names(needs_attention(session, one, today=TODAY).overdue) == ["One Co"]
