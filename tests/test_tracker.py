@@ -8,8 +8,11 @@ from apply_spy.profiles import ProfileNotFound, create_profile, delete_profile
 from apply_spy.tracker import (
     ApplicationNotFound,
     InvalidApplication,
+    InvalidStatus,
+    change_status,
     create_application,
     list_applications,
+    list_status_events,
     update_application_details,
 )
 
@@ -201,3 +204,169 @@ def test_deleting_a_profile_removes_its_applications_and_history_only(engine, tw
         assert len(session.scalars(select(StatusEvent)).all()) == 1
     with engine.connect() as conn:
         assert conn.execute(text("PRAGMA foreign_key_check")).all() == []  # no orphans
+
+
+# --- Changing status (story 2.2) ------------------------------------------
+
+
+def _changes(events):
+    """(old, new) pairs, skipping the first 'added' event that has no old status."""
+    return [(e.old_status, e.new_status) for e in events if e.old_status is not None]
+
+
+def test_status_moves_through_the_pipeline_with_ordered_history(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+
+    with session_scope(engine) as session:
+        change_status(session, one, app_id, "Online assessment")
+    with session_scope(engine) as session:
+        change_status(session, one, app_id, "Interview")
+
+    with session_scope(engine) as session:
+        [app] = list_applications(session, one)
+        events = list_status_events(session, one, app_id)
+    assert app.status == "Interview"
+    assert _changes(events) == [
+        ("Applied", "Online assessment"),
+        ("Online assessment", "Interview"),
+    ]
+    assert all(e.changed_at is not None for e in events)
+    # The first event records the application being added.
+    assert (events[0].old_status, events[0].new_status) == (None, "Applied")
+
+
+def test_unknown_status_is_rejected_and_changes_nothing(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+
+    with pytest.raises(InvalidStatus):
+        with session_scope(engine) as session:
+            change_status(session, one, app_id, "Super offer")
+
+    with session_scope(engine) as session:
+        assert list_applications(session, one)[0].status == "Applied"
+        assert len(list_status_events(session, one, app_id)) == 1
+
+
+def test_choosing_the_same_status_adds_no_event(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+    with session_scope(engine) as session:
+        change_status(session, one, app_id, "Applied")
+    with session_scope(engine) as session:
+        assert len(list_status_events(session, one, app_id)) == 1
+
+
+def test_if_saving_the_history_fails_the_status_does_not_change(engine, two_profiles, monkeypatch):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+
+    def broken_event(**_kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr("apply_spy.tracker.service.StatusEvent", broken_event)
+    with pytest.raises(RuntimeError):
+        with session_scope(engine) as session:
+            change_status(session, one, app_id, "Interview")
+    monkeypatch.undo()
+
+    with session_scope(engine) as session:
+        assert list_applications(session, one)[0].status == "Applied"
+        assert len(list_status_events(session, one, app_id)) == 1
+
+
+def test_cannot_change_or_read_another_profiles_application(engine, two_profiles):
+    one, two = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "One Co", "Engineer").id
+
+    with pytest.raises(ApplicationNotFound):
+        with session_scope(engine) as session:
+            change_status(session, two, app_id, "Offer")
+    with pytest.raises(ApplicationNotFound):
+        with session_scope(engine) as session:
+            list_status_events(session, two, app_id)
+    with session_scope(engine) as session:
+        assert list_applications(session, one)[0].status == "Applied"
+
+
+# --- Editing every field ---------------------------------------------------
+
+
+def test_every_detail_can_be_edited(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+
+    with session_scope(engine) as session:
+        update_application_details(
+            session,
+            one,
+            app_id,
+            company="Acme Corp",
+            title="Senior Engineer",
+            url="https://acme.example/jobs/2",
+            location="Mountain View, CA",
+            salary_range="170k-200k",
+            resume_version="Backend v3",
+            notes="Second round booked.",
+            date_applied=date(2026, 10, 30),
+        )
+    with session_scope(engine) as session:
+        [app] = list_applications(session, one)
+    assert (app.company, app.title) == ("Acme Corp", "Senior Engineer")
+    assert app.url == "https://acme.example/jobs/2"
+    assert (app.location, app.salary_range) == ("Mountain View, CA", "170k-200k")
+    assert (app.resume_version, app.notes) == ("Backend v3", "Second round booked.")
+    assert app.date_applied == date(2026, 10, 30)
+
+
+def test_editing_details_does_not_touch_status_or_history(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+    with session_scope(engine) as session:
+        update_application_details(session, one, app_id, company="Acme Corp")
+    with session_scope(engine) as session:
+        assert list_applications(session, one)[0].status == "Applied"
+        assert len(list_status_events(session, one, app_id)) == 1
+
+
+@pytest.mark.parametrize("field", ["company", "title"])
+def test_cannot_blank_out_company_or_title(engine, two_profiles, field):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+
+    with pytest.raises(InvalidApplication) as error:
+        with session_scope(engine) as session:
+            update_application_details(session, one, app_id, **{field: "  "})
+    assert error.value.field == field
+
+
+def test_one_bad_value_changes_nothing(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+
+    with pytest.raises(InvalidApplication):
+        with session_scope(engine) as session:
+            update_application_details(session, one, app_id, company="New Name", url="not-a-link")
+
+    with session_scope(engine) as session:
+        assert list_applications(session, one)[0].company == "Acme"
+
+
+def test_clearing_an_optional_field_works(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer", location="Seattle").id
+    with session_scope(engine) as session:
+        update_application_details(session, one, app_id, location="")
+    with session_scope(engine) as session:
+        assert list_applications(session, one)[0].location is None

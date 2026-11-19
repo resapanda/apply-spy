@@ -1,6 +1,8 @@
 """Local web UI (NiceGUI). No business logic here: it calls the service layer."""
 
+import json
 from contextlib import contextmanager
+from datetime import UTC, date
 
 from nicegui import app, ui
 
@@ -14,7 +16,18 @@ from apply_spy.profiles import (
     get_active_profile,
     list_profiles,
 )
-from apply_spy.tracker import InvalidApplication, create_application, list_applications
+from apply_spy.tracker import (
+    STATUSES,
+    ApplicationNotFound,
+    InvalidApplication,
+    InvalidStatus,
+    change_status,
+    create_application,
+    get_application,
+    list_applications,
+    list_status_events,
+    update_application_details,
+)
 
 engine = make_engine()
 init_db(engine)
@@ -58,6 +71,12 @@ def applications_page() -> None:
         _applications_content(active_id)
 
 
+@ui.page("/applications/{application_id}")
+def application_page(application_id: int) -> None:
+    with page_layout() as active_id:
+        _application_detail_content(active_id, application_id)
+
+
 @ui.page("/profiles")
 def profiles_page() -> None:
     with page_layout():
@@ -99,12 +118,38 @@ def _applications_content(profile_id: int | None) -> None:
             ui.label("No applications yet. Add your first one above.").props("data-testid=empty")
             return
         grid = ui.table(columns=columns, rows=rows, row_key="id").props("data-testid=applications")
+        grid.add_slot(
+            "body-cell-company",
+            '<q-td :props="props"><a :href="\'/applications/\' + props.row.id" '
+            'class="text-primary" style="text-decoration: underline">'
+            "{{ props.value }}</a></q-td>",
+        )
+        # Status is a dropdown in every row: choosing from a list avoids typos.
+        # The options are our own fixed list, so embedding them here is safe.
+        grid.add_slot(
+            "body-cell-status",
+            '<q-td :props="props"><q-select dense outlined options-dense '
+            f":options='{json.dumps(list(STATUSES))}' :model-value=\"props.value\" "
+            "@update:model-value=\"(value) => $parent.$emit('status_change', "
+            '{id: props.row.id, status: value})" /></q-td>',
+        )
+        grid.on("status_change", on_row_status_change)
         # Links are checked to be http(s) by the service before they are saved.
         grid.add_slot(
             "body-cell-link",
             '<q-td :props="props"><a v-if="props.value" :href="props.value" '
             'target="_blank" rel="noopener">Open</a></q-td>',
         )
+
+    def on_row_status_change(event) -> None:
+        try:
+            with session_scope(engine) as session:
+                change_status(session, profile_id, event.args["id"], event.args["status"])
+        except (InvalidStatus, ApplicationNotFound) as error:
+            ui.notify(str(error), type="negative")
+        else:
+            ui.notify(f"Status: {event.args['status']}", type="positive")
+        table.refresh()  # shows the saved value (or puts the old one back after an error)
 
     def submit() -> None:
         try:
@@ -143,6 +188,116 @@ def _applications_content(profile_id: int | None) -> None:
         notes = ui.textarea("Notes").classes("w-full")
 
     table()
+
+
+def _application_detail_content(profile_id: int | None, application_id: int) -> None:
+    ui.link("< Back to applications", "/")
+    if profile_id is None:
+        ui.label("Create a profile first.")
+        return
+    try:
+        with session_scope(engine) as session:
+            application = get_application(session, profile_id, application_id)
+    except ApplicationNotFound:
+        # Also what you see for another profile's application: it is not yours to open.
+        ui.label("Application not found in this profile.").props("data-testid=not-found")
+        return
+
+    heading = ui.label(f"{application.company}: {application.title}").classes(
+        "text-xl font-bold mt-2"
+    )
+
+    # Edit form: every detail can be changed. The date is picked from a calendar
+    # (read-only text box) so it can never be mistyped.
+    with ui.card().classes("w-full max-w-2xl"):
+        with ui.row().classes("gap-2"):
+            company = ui.input("Company", value=application.company)
+            title = ui.input("Title", value=application.title)
+        link = ui.input("Link", value=application.url or "").classes("w-full")
+        with ui.row().classes("gap-2"):
+            location = ui.input("Location", value=application.location or "")
+            salary = ui.input("Salary range", value=application.salary_range or "")
+            resume = ui.input("Resume version", value=application.resume_version or "")
+        with ui.input("Date applied", value=application.date_applied.isoformat()).props(
+            "readonly"
+        ) as date_input:
+            with ui.menu().props("no-parent-event") as menu:
+                with ui.date().bind_value(date_input):
+                    with ui.row().classes("justify-end"):
+                        ui.button("Close", on_click=menu.close).props("flat")
+            with date_input.add_slot("append"):
+                ui.icon("edit_calendar").on("click", menu.open).classes("cursor-pointer")
+        notes = ui.textarea("Notes", value=application.notes or "").classes("w-full")
+
+        def save() -> None:
+            try:
+                with session_scope(engine) as session:
+                    updated = update_application_details(
+                        session,
+                        profile_id,
+                        application_id,
+                        company=company.value,
+                        title=title.value,
+                        url=link.value,
+                        location=location.value,
+                        salary_range=salary.value,
+                        resume_version=resume.value,
+                        notes=notes.value,
+                        date_applied=date.fromisoformat(date_input.value),
+                    )
+                    heading_text = f"{updated.company}: {updated.title}"
+            except (InvalidApplication, ApplicationNotFound) as error:
+                ui.notify(str(error), type="negative")
+                return
+            heading.set_text(heading_text)
+            ui.notify("Saved", type="positive")
+
+        ui.button("Save changes", on_click=save).props("data-testid=save-button")
+
+    @ui.refreshable
+    def history() -> None:
+        with session_scope(engine) as session:
+            events = list_status_events(session, profile_id, application_id)
+        # The first event (no old status) is the "added" line above, not a change.
+        rows = [
+            {
+                "id": e.id,
+                "when": e.changed_at.replace(tzinfo=UTC).astimezone().strftime("%Y-%m-%d %H:%M"),
+                "old": e.old_status,
+                "new": e.new_status,
+            }
+            for e in events
+            if e.old_status is not None
+        ]
+        ui.label("Status history").classes("text-lg mt-4")
+        if not rows:
+            ui.label("No status changes yet.").props("data-testid=no-history")
+            return
+        # Read-only on purpose: history is a record, so there is no edit control.
+        ui.table(
+            columns=[
+                {"name": "when", "label": "When", "field": "when", "align": "left"},
+                {"name": "old", "label": "From", "field": "old", "align": "left"},
+                {"name": "new", "label": "To", "field": "new", "align": "left"},
+            ],
+            rows=rows,
+            row_key="id",
+        ).props("data-testid=history")
+
+    def on_status_change(event) -> None:
+        try:
+            with session_scope(engine) as session:
+                change_status(session, profile_id, application_id, event.value)
+        except (InvalidStatus, ApplicationNotFound) as error:
+            ui.notify(str(error), type="negative")
+            return
+        ui.notify(f"Status: {event.value}", type="positive")
+        history.refresh()
+
+    ui.select(
+        list(STATUSES), value=application.status, label="Status", on_change=on_status_change
+    ).props("data-testid=status-select").classes("w-64 mt-4")
+    history()
 
 
 def _profiles_content() -> None:
