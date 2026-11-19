@@ -17,6 +17,14 @@ class DuplicateProfileName(ValueError):
     """A profile with this name already exists (ignoring case)."""
 
 
+class ProfileNotFound(LookupError):
+    """No profile with this id."""
+
+
+class ConfirmationRequired(ValueError):
+    """Deletion was not explicitly confirmed, so nothing is deleted."""
+
+
 def create_profile(session: Session, name: str) -> Profile:
     name = " ".join(name.split())  # trim and collapse extra spaces
     if not name:
@@ -55,3 +63,20 @@ def get_active_profile(session: Session, profile_id: int | None) -> Profile | No
             return profile
     profiles = list_profiles(session)
     return profiles[0] if profiles else None
+
+
+def delete_profile(session: Session, profile_id: int, confirmed: bool) -> None:
+    """Delete a profile and everything it owns.
+
+    Safety: nothing is deleted unless confirmed is True (the UI's checkbox or
+    the CLI's "yes"). Owned rows in other tables are removed by the database
+    itself (ON DELETE CASCADE on profile_id), in the same transaction, so no
+    orphans are left behind.
+    """
+    profile = session.get(Profile, profile_id)
+    if profile is None:
+        raise ProfileNotFound(f"No profile with id {profile_id}.")
+    if confirmed is not True:
+        raise ConfirmationRequired("Deletion was not confirmed, so nothing was deleted.")
+    session.delete(profile)
+    session.flush()

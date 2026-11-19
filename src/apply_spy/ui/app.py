@@ -6,9 +6,11 @@ from nicegui import app, ui
 
 from apply_spy.db import init_db, make_engine, session_scope
 from apply_spy.profiles import (
+    ConfirmationRequired,
     DuplicateProfileName,
     InvalidProfileName,
     create_profile,
+    delete_profile,
     get_active_profile,
     list_profiles,
 )
@@ -62,7 +64,40 @@ def _profiles_content() -> None:
         if not profiles:
             ui.label("No profiles yet. Create one below.").props("data-testid=empty")
         for profile in profiles:
-            ui.label(profile.name).props("data-testid=profile-name")
+            with ui.row().classes("items-center"):
+                ui.label(profile.name).props("data-testid=profile-name")
+                ui.button(
+                    icon="delete",
+                    color="negative",
+                    on_click=lambda _, p=profile: confirm_delete(p.id, p.name),
+                ).props("flat dense data-testid=delete-button")
+
+    def confirm_delete(profile_id: int, name: str) -> None:
+        with ui.dialog() as dialog, ui.card():
+            ui.label(f"Delete {name}?").classes("text-lg font-bold")
+            ui.label("This permanently removes the profile and all of its data.")
+            confirm = ui.checkbox("Yes, delete this profile and all its data").props(
+                "data-testid=confirm-checkbox"
+            )
+
+            def do_delete() -> None:
+                try:
+                    with session_scope(engine) as session:
+                        delete_profile(session, profile_id, confirm.value)
+                except ConfirmationRequired as error:
+                    ui.notify(str(error), type="negative")
+                    return
+                dialog.close()
+                ui.notify(f"Deleted {name}", type="positive")
+                ui.navigate.reload()  # header switcher must drop the deleted profile
+
+            with ui.row():
+                ui.button("Cancel", on_click=dialog.close).props("flat")
+                # The button is only a convenience; the service enforces the check.
+                ui.button("Delete", color="negative", on_click=do_delete).props(
+                    "data-testid=confirm-delete-button"
+                ).bind_enabled_from(confirm, "value")
+        dialog.open()
 
     profile_list()
 
