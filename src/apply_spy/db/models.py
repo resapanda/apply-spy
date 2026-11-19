@@ -50,6 +50,8 @@ class Application(Base):
     notes: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(50))
     date_applied: Mapped[date] = mapped_column(Date)
+    follow_up_date: Mapped[date | None] = mapped_column(Date)
+    follow_up_label: Mapped[str | None] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )

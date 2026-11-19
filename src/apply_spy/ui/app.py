@@ -32,6 +32,7 @@ from apply_spy.tracker import (
     get_application,
     list_applications,
     list_status_events,
+    set_follow_up,
     update_application_details,
 )
 
@@ -126,10 +127,78 @@ def _current_filters() -> dict:
     return saved
 
 
+def _follow_up_text(follow_up_date, label) -> str:
+    """ "2026-11-25 · OA due", or "" when there is no follow-up."""
+    if follow_up_date is None:
+        return ""
+    return f"{follow_up_date.isoformat()} · {label}" if label else follow_up_date.isoformat()
+
+
+def _follow_up_dialog(profile_id: int, application_id: int, on_saved) -> None:
+    """Set, change or clear an application's follow-up date from a calendar picker.
+
+    Used by the board cards, the table and the detail page, so it works without
+    opening the detail page. The date comes from a picker, so it cannot be mistyped.
+    """
+    try:
+        with session_scope(engine) as session:
+            application = get_application(session, profile_id, application_id)
+            company = application.company
+            current_date = application.follow_up_date
+            current_label = application.follow_up_label
+    except ApplicationNotFound as error:
+        ui.notify(str(error), type="negative")
+        return
+
+    with ui.dialog() as dialog, ui.card():
+        ui.label(f"Follow-up for {company}").classes("text-lg font-bold")
+        picked = ui.date(value=(current_date or date.today()).isoformat())
+        label = ui.input("Label (optional), for example OA due", value=current_label or "").props(
+            "data-testid=follow-up-label"
+        )
+
+        def save(new_date, new_label, message) -> None:
+            try:
+                with session_scope(engine) as session:
+                    set_follow_up(session, profile_id, application_id, new_date, new_label)
+            except (InvalidApplication, ApplicationNotFound) as error:
+                ui.notify(str(error), type="negative")
+                return
+            dialog.close()
+            ui.notify(message, type="positive")
+            on_saved()
+
+        with ui.row():
+            ui.button("Cancel", on_click=dialog.close).props("flat")
+            if current_date is not None:
+                ui.button("Clear", on_click=lambda: save(None, None, "Follow-up cleared")).props(
+                    "flat color=negative"
+                )
+            ui.button(
+                "Save",
+                on_click=lambda: save(picked.value, label.value, "Follow-up saved"),
+            ).props("data-testid=follow-up-save")
+    dialog.open()
+
+
+def _follow_up_card_html(a) -> str:
+    """The follow-up line of a board card, with a button that asks the server to open
+    the follow-up dialog (the id is a number from our own database)."""
+    text = _follow_up_text(a.follow_up_date, a.follow_up_label)
+    action = "Change" if a.follow_up_date else "Set follow-up"
+    shown = f"Follow up: {html.escape(text)} " if text else ""
+    return (
+        f"{shown}"
+        f'<a href="#" style="text-decoration:underline" '
+        f"onclick=\"emitEvent('follow_up', {{id: {int(a.id)}}}); return false;\">{action}</a>"
+    )
+
+
 def _board_html(applications) -> str:
     """The board as one HTML block (much lighter than thousands of widgets).
 
-    Everything shown is escaped, and the only link is to our own detail page.
+    Everything shown is escaped. The only links go to our own detail page, and the
+    follow-up button sends the application's id (a number) back to the server.
     """
     by_status = {name: [] for name in STATUSES}
     for a in applications:
@@ -141,7 +210,8 @@ def _board_html(applications) -> str:
             f'padding:6px;margin-top:6px"><a href="/applications/{a.id}" '
             f'style="font-weight:600;text-decoration:underline">{html.escape(a.company)}</a>'
             f"<div>{html.escape(a.title)}</div>"
-            f'<div style="opacity:.7;font-size:.85em">{a.date_applied.isoformat()}</div></div>'
+            f'<div style="opacity:.7;font-size:.85em">{a.date_applied.isoformat()}</div>'
+            f'<div style="font-size:.85em">{_follow_up_card_html(a)}</div></div>'
             for a in cards
         )
         columns.append(
@@ -173,6 +243,7 @@ def _applications_content(profile_id: int | None) -> None:
         {"name": "location", "label": "Location", "field": "location", "align": "left"},
         {"name": "status", "label": "Status", "field": "status", "align": "left"},
         {"name": "date", "label": "Applied", "field": "date_applied", "align": "left"},
+        {"name": "follow_up", "label": "Follow-up", "field": "follow_up", "align": "left"},
         {"name": "link", "label": "Link", "field": "url", "align": "left"},
     ]
 
@@ -215,6 +286,7 @@ def _applications_content(profile_id: int | None) -> None:
                     "location": a.location or "",
                     "status": a.status,
                     "date_applied": a.date_applied.isoformat(),
+                    "follow_up": _follow_up_text(a.follow_up_date, a.follow_up_label),
                     "url": a.url or "",
                 }
                 for a in found
@@ -255,12 +327,30 @@ def _applications_content(profile_id: int | None) -> None:
             '{id: props.row.id, status: value})" /></q-td>',
         )
         grid.on("status_change", on_row_status_change)
+        # The calendar button in each row opens the same follow-up dialog as the board cards.
+        grid.add_slot(
+            "body-cell-follow_up",
+            '<q-td :props="props">{{ props.value }} <q-btn flat dense round size="sm" '
+            'icon="event" @click="() => $parent.$emit(\'follow_up\', {id: props.row.id})" />'
+            "</q-td>",
+        )
+        grid.on("follow_up", open_follow_up)
         # Links are checked to be http(s) by the service before they are saved.
         grid.add_slot(
             "body-cell-link",
             '<q-td :props="props"><a v-if="props.value" :href="props.value" '
             'target="_blank" rel="noopener">Open</a></q-td>',
         )
+
+    def open_follow_up(event) -> None:
+        """Open the follow-up dialog for the application whose button was clicked."""
+        application_id = event.args.get("id") if isinstance(event.args, dict) else None
+        if isinstance(application_id, int):
+            _follow_up_dialog(profile_id, application_id, results.refresh)
+
+    # Board cards live inside one HTML block, so their buttons send a page-level event.
+    # Registered once here (not inside results(), which re-runs on every refresh).
+    ui.on("follow_up", open_follow_up)
 
     def on_row_status_change(event) -> None:
         try:
@@ -360,6 +450,17 @@ def _application_detail_content(profile_id: int | None, application_id: int) -> 
     heading = ui.label(f"{application.company}: {application.title}").classes(
         "text-xl font-bold mt-2"
     )
+
+    with ui.row().classes("items-center gap-2"):
+        text = _follow_up_text(application.follow_up_date, application.follow_up_label)
+        ui.label(f"Follow-up: {text}" if text else "No follow-up set").props(
+            "data-testid=follow-up"
+        )
+        ui.button(
+            "Change follow-up" if text else "Set follow-up",
+            icon="event",
+            on_click=lambda: _follow_up_dialog(profile_id, application_id, ui.navigate.reload),
+        ).props("flat")
 
     # Edit form: every detail can be changed. The date is picked from a calendar
     # (read-only text box) so it can never be mistyped.

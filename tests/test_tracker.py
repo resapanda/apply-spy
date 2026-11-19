@@ -19,6 +19,7 @@ from apply_spy.tracker import (
     export_applications_csv,
     list_applications,
     list_status_events,
+    set_follow_up,
     update_application_details,
 )
 
@@ -546,6 +547,8 @@ def test_export_has_a_header_naming_every_field_and_one_row_per_application(engi
         "Resume version",
         "Status",
         "Date applied",
+        "Follow-up date",
+        "Follow-up label",
         "Notes",
         "Added",
     ]
@@ -658,7 +661,8 @@ def test_cli_export_writes_a_utf8_file_and_prints_to_the_screen(tmp_path, monkey
     assert main(["export", str(profile_id), "--output", str(target)]) == 0
     with open(target, encoding="utf-8", newline="") as file:
         rows = list(csv.reader(file))
-    assert rows[1][0] == "Café" and rows[1][8] == "a, b\nc"
+    first = dict(zip(rows[0], rows[1], strict=True))
+    assert first["Company"] == "Café" and first["Notes"] == "a, b\nc"
 
     capsys.readouterr()
     assert main(["export", str(profile_id)]) == 0
@@ -669,3 +673,179 @@ def test_cli_export_unknown_profile_is_an_error(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("APPLY_SPY_DATA_DIR", str(tmp_path))
     assert main(["export", "999"]) == 1
     assert "No profile with id 999" in capsys.readouterr().out
+
+
+# --- Follow-up dates (story 4.1) --------------------------------------------
+
+
+def test_set_follow_up_date_and_label(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+    with session_scope(engine) as session:
+        set_follow_up(session, one, app_id, date(2026, 11, 25), "OA due")
+
+    with session_scope(engine) as session:
+        [app] = list_applications(session, one)
+    assert app.follow_up_date == date(2026, 11, 25)
+    assert app.follow_up_label == "OA due"
+
+
+def test_the_label_is_optional(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+        set_follow_up(session, one, app_id, date(2026, 11, 25))
+    with session_scope(engine) as session:
+        [app] = list_applications(session, one)
+    assert (app.follow_up_date, app.follow_up_label) == (date(2026, 11, 25), None)
+
+
+def test_new_applications_have_no_follow_up(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app = create_application(session, one, "Acme", "Engineer")
+    assert (app.follow_up_date, app.follow_up_label) == (None, None)
+
+
+def test_follow_up_can_be_changed_and_cleared(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+        set_follow_up(session, one, app_id, "2026-11-25", "Check in")
+    with session_scope(engine) as session:
+        set_follow_up(session, one, app_id, "2026-12-01", "Call recruiter")
+    with session_scope(engine) as session:
+        [app] = list_applications(session, one)
+        assert (app.follow_up_date, app.follow_up_label) == (date(2026, 12, 1), "Call recruiter")
+        set_follow_up(session, one, app_id, None)  # clears both
+    with session_scope(engine) as session:
+        [app] = list_applications(session, one)
+    assert (app.follow_up_date, app.follow_up_label) == (None, None)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "11/25/2026",
+        "25-11-2026",
+        "2026-1-5",
+        "20261125",
+        "2026-W47-2",
+        "tomorrow",
+        "2026-13-01",
+        "2026-02-30",
+    ],
+)
+def test_a_date_in_an_invalid_format_is_rejected_with_a_message(engine, two_profiles, bad):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+        set_follow_up(session, one, app_id, date(2026, 11, 25), "Keep me")
+
+    with pytest.raises(InvalidApplication) as error:
+        with session_scope(engine) as session:
+            set_follow_up(session, one, app_id, bad, "New label")
+
+    assert error.value.field == "follow-up date"
+    assert "2026-11-30" in str(error.value) or "real date" in str(error.value)
+    with session_scope(engine) as session:  # nothing was changed
+        [app] = list_applications(session, one)
+    assert (app.follow_up_date, app.follow_up_label) == (date(2026, 11, 25), "Keep me")
+
+
+def test_a_label_without_a_date_is_rejected(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+    with pytest.raises(InvalidApplication) as error:
+        with session_scope(engine) as session:
+            set_follow_up(session, one, app_id, None, "OA due")
+    assert error.value.field == "follow-up date"
+
+
+def test_a_too_long_label_is_rejected(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+    with pytest.raises(InvalidApplication) as error:
+        with session_scope(engine) as session:
+            set_follow_up(session, one, app_id, date(2026, 11, 25), "x" * 101)
+    assert error.value.field == "follow-up label"
+
+
+def test_cannot_set_a_follow_up_on_another_profiles_application(engine, two_profiles):
+    one, two = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "One Co", "Engineer").id
+    with pytest.raises(ApplicationNotFound):
+        with session_scope(engine) as session:
+            set_follow_up(session, two, app_id, date(2026, 11, 25))
+    with session_scope(engine) as session:
+        assert list_applications(session, one)[0].follow_up_date is None
+
+
+def test_setting_a_follow_up_does_not_touch_status_or_history(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+        set_follow_up(session, one, app_id, date(2026, 11, 25), "OA due")
+    with session_scope(engine) as session:
+        assert list_applications(session, one)[0].status == "Applied"
+        assert len(list_status_events(session, one, app_id)) == 1
+
+
+def test_follow_up_appears_in_the_csv_export(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        app_id = create_application(session, one, "Acme", "Engineer").id
+        set_follow_up(session, one, app_id, date(2026, 11, 25), "OA due")
+    with session_scope(engine) as session:
+        rows = _read_csv(export_applications_csv(session, one))
+    record = dict(zip(rows[0], rows[1], strict=True))
+    assert (record["Follow-up date"], record["Follow-up label"]) == ("2026-11-25", "OA due")
+
+
+# --- An older database gets the new columns (and keeps its data) -------------
+
+
+def test_init_db_adds_the_follow_up_columns_to_an_older_database(tmp_path):
+    import sqlite3
+
+    from sqlalchemy import inspect
+
+    db = tmp_path / "old.db"
+    old = sqlite3.connect(db)
+    old.executescript(
+        """
+        CREATE TABLE profiles (id INTEGER PRIMARY KEY, name VARCHAR(100) NOT NULL,
+            created_at DATETIME);
+        CREATE TABLE applications (
+            id INTEGER PRIMARY KEY,
+            profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+            company VARCHAR(200) NOT NULL, title VARCHAR(200) NOT NULL,
+            url VARCHAR(2000), location VARCHAR(200), salary_range VARCHAR(100),
+            resume_version VARCHAR(200), notes TEXT, status VARCHAR(50) NOT NULL,
+            date_applied DATE NOT NULL, created_at DATETIME);
+        INSERT INTO profiles (id, name) VALUES (1, 'Sample One');
+        INSERT INTO applications (profile_id, company, title, status, date_applied)
+            VALUES (1, 'Acme', 'Engineer', 'Applied', '2026-11-01');
+        """
+    )
+    old.commit()
+    old.close()
+
+    engine = make_engine(f"sqlite:///{db}")
+    try:
+        init_db(engine)
+        init_db(engine)  # running it again must be harmless
+        columns = {c["name"] for c in inspect(engine).get_columns("applications")}
+        assert {"follow_up_date", "follow_up_label"} <= columns
+        with session_scope(engine) as session:
+            [app] = list_applications(session, 1)
+            assert (app.company, app.status, app.follow_up_date) == ("Acme", "Applied", None)
+            set_follow_up(session, 1, app.id, date(2026, 11, 25), "OA due")
+        with session_scope(engine) as session:
+            assert list_applications(session, 1)[0].follow_up_label == "OA due"
+    finally:
+        engine.dispose()
