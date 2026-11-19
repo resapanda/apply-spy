@@ -15,7 +15,7 @@ Work items live in GitHub Issues (one per user story, grouped by sprint mileston
 
 ## Current status
 
-Sprint 1 (v0.1) in progress. Scaffold and story 1.1 (create a profile) exist: SQLite models, profile service, CLI and a NiceGUI page. Update this section as the project moves.
+Sprint 1 (v0.1) in progress. Done: stories 1.1 (create a profile), 1.2 (switch the active profile), 1.3 (delete a profile) and 2.1 (add an application: tables, tracker service, quick-add form and a simple list; the board and table views are story 2.3). Update this section as the project moves.
 
 ## Decisions already made (do not re-ask)
 
