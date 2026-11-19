@@ -6,7 +6,7 @@ that profile's rows.
 
 from datetime import date
 
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from apply_spy.db.models import Application, Profile, StatusEvent
@@ -25,6 +25,9 @@ STATUSES = (
     "Ghosted",
 )
 DEFAULT_STATUS = "Applied"
+
+# "created" is when the application was added; the others are what you see in the table.
+SORT_FIELDS = ("created", "date_applied", "company", "status")
 
 MAX_SHORT = 200
 MAX_URL = 2000
@@ -177,15 +180,49 @@ def update_application_details(
     return application
 
 
-def list_applications(session: Session, profile_id: int) -> list[Application]:
-    """This profile's applications, newest first."""
-    return list(
-        session.scalars(
-            select(Application)
-            .where(Application.profile_id == profile_id)
-            .order_by(Application.created_at.desc(), Application.id.desc())
+def list_applications(
+    session: Session,
+    profile_id: int,
+    *,
+    status: str | None = None,
+    search: str | None = None,
+    sort_by: str = "created",
+    descending: bool = True,
+) -> list[Application]:
+    """This profile's applications. The table and the board both use this.
+
+    status: only this status. search: case-insensitive text found in the
+    company, title or location (% and _ are treated as plain characters).
+    sort_by: one of SORT_FIELDS; "status" sorts in pipeline order (Saved first).
+    The default is newest-added first.
+    """
+    if status is not None and status not in STATUSES:
+        raise InvalidStatus(f"Unknown status: {status!r}.")
+    if sort_by not in SORT_FIELDS:
+        raise ValueError(f"Cannot sort by {sort_by!r}.")
+
+    query = select(Application).where(Application.profile_id == profile_id)
+    if status is not None:
+        query = query.where(Application.status == status)
+    term = _short_text(search)
+    if term is not None:
+        query = query.where(
+            Application.company.icontains(term, autoescape=True)
+            | Application.title.icontains(term, autoescape=True)
+            | Application.location.icontains(term, autoescape=True)
         )
-    )
+
+    sort_columns = {
+        "created": Application.created_at,
+        "date_applied": Application.date_applied,
+        "company": func.lower(Application.company),
+        "status": case({name: i for i, name in enumerate(STATUSES)}, value=Application.status),
+    }
+    column = sort_columns[sort_by]
+    primary = column.desc() if descending else column.asc()
+    # Ties: the most recently added first, so the order is always predictable.
+    query = query.order_by(primary, Application.created_at.desc(), Application.id.desc())
+    return list(session.scalars(query))
 
 
 def get_application(session: Session, profile_id: int, application_id: int) -> Application:

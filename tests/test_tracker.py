@@ -1,4 +1,5 @@
-from datetime import date
+import time
+from datetime import date, timedelta
 
 import pytest
 from sqlalchemy import select, text
@@ -6,6 +7,7 @@ from sqlalchemy import select, text
 from apply_spy.db import Application, StatusEvent, session_scope
 from apply_spy.profiles import ProfileNotFound, create_profile, delete_profile
 from apply_spy.tracker import (
+    STATUSES,
     ApplicationNotFound,
     InvalidApplication,
     InvalidStatus,
@@ -370,3 +372,146 @@ def test_clearing_an_optional_field_works(engine, two_profiles):
         update_application_details(session, one, app_id, location="")
     with session_scope(engine) as session:
         assert list_applications(session, one)[0].location is None
+
+
+# --- Filter, search and sort (story 2.3) ----------------------------------
+
+
+def _fifty_applications(engine, profile_id):
+    """50 applications over several companies and statuses (made-up data)."""
+    companies = ["Acme", "Globex", "Initech", "Umbrella", "Hooli"]
+    statuses = ["Applied", "Interview", "Offer", "Rejected", "Online assessment"]
+    with session_scope(engine) as session:
+        for i in range(50):
+            app_id = create_application(
+                session,
+                profile_id,
+                companies[i % 5],
+                f"Engineer {i}",
+                location="Seattle, WA" if i % 2 == 0 else "Mountain View, CA",
+                date_applied=date(2026, 10, 1) + timedelta(days=i),
+            ).id
+            if statuses[(i // 5) % 5] != "Applied":
+                change_status(session, profile_id, app_id, statuses[(i // 5) % 5])
+
+
+def test_filter_by_status_and_search_together(engine, two_profiles):
+    one, _ = two_profiles
+    _fifty_applications(engine, one)
+
+    with session_scope(engine) as session:
+        everything = list_applications(session, one)
+        interviews = list_applications(session, one, status="Interview")
+        both = list_applications(session, one, status="Interview", search="acme")
+    assert len(everything) == 50
+    assert interviews and all(a.status == "Interview" for a in interviews)
+    assert both
+    assert all(a.status == "Interview" and a.company == "Acme" for a in both)
+    # Exactly the applications that match both conditions, no more and no fewer.
+    expected = [a.id for a in everything if a.status == "Interview" and a.company == "Acme"]
+    assert sorted(a.id for a in both) == sorted(expected)
+
+
+def test_search_is_case_insensitive_and_covers_company_title_and_location(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        create_application(session, one, "Acme", "Backend Engineer", location="Seattle")
+        create_application(session, one, "Globex", "Frontend Developer", location="Mountain View")
+
+    def found(term):
+        with session_scope(engine) as session:
+            return sorted(a.company for a in list_applications(session, one, search=term))
+
+    assert found("ACME") == ["Acme"]
+    assert found("frontend") == ["Globex"]
+    assert found("mountain") == ["Globex"]
+    assert found("  acme  ") == ["Acme"]  # extra spaces ignored
+    assert found("") == ["Acme", "Globex"]  # empty search shows everything
+    assert found("nothing like this") == []
+
+
+def test_search_treats_percent_and_underscore_as_plain_characters(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        create_application(session, one, "Acme", "Engineer")
+        create_application(session, one, "100% Remote Co", "Engineer")
+
+    with session_scope(engine) as session:
+        assert [a.company for a in list_applications(session, one, search="%")] == [
+            "100% Remote Co"
+        ]
+        assert list_applications(session, one, search="_") == []
+
+
+def test_filters_never_leak_the_other_profiles_applications(engine, two_profiles):
+    one, two = two_profiles
+    with session_scope(engine) as session:
+        create_application(session, one, "Acme", "Engineer")
+        create_application(session, two, "Acme", "Engineer")
+
+    with session_scope(engine) as session:
+        found = list_applications(session, one, status="Applied", search="acme")
+    assert [a.profile_id for a in found] == [one]
+
+
+def test_sort_by_date_applied_company_and_status(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        a = create_application(session, one, "beta", "Eng", date_applied=date(2026, 11, 3)).id
+        create_application(session, one, "Alpha", "Eng", date_applied=date(2026, 11, 1))
+        c = create_application(session, one, "Gamma", "Eng", date_applied=date(2026, 11, 2)).id
+        change_status(session, one, a, "Offer")
+        change_status(session, one, c, "Saved")
+
+    def companies(sort_by, descending):
+        with session_scope(engine) as session:
+            return [
+                x.company
+                for x in list_applications(session, one, sort_by=sort_by, descending=descending)
+            ]
+
+    assert companies("date_applied", False) == ["Alpha", "Gamma", "beta"]
+    assert companies("date_applied", True) == ["beta", "Gamma", "Alpha"]
+    assert companies("company", False) == ["Alpha", "beta", "Gamma"]  # ignores upper/lower case
+    assert companies("company", True) == ["Gamma", "beta", "Alpha"]
+    # Pipeline order: Saved, then Applied, then Offer (not alphabetical).
+    assert companies("status", False) == ["Gamma", "Alpha", "beta"]
+    assert companies("status", True) == ["beta", "Alpha", "Gamma"]
+
+
+def test_default_order_is_newest_added_first(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        create_application(session, one, "First", "Eng")
+        create_application(session, one, "Second", "Eng")
+    with session_scope(engine) as session:
+        assert [a.company for a in list_applications(session, one)] == ["Second", "First"]
+
+
+def test_bad_filter_or_sort_values_are_rejected(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        with pytest.raises(InvalidStatus):
+            list_applications(session, one, status="Super offer")
+        with pytest.raises(ValueError):
+            list_applications(session, one, sort_by="notes; DROP TABLE applications")
+
+
+def test_1000_applications_load_and_filter_quickly(engine, two_profiles):
+    one, two = two_profiles
+    with session_scope(engine) as session:
+        for i in range(1000):
+            owner = one if i % 4 else two  # 750 for one, 250 for two
+            app = create_application(session, owner, f"Company {i % 40}", f"Engineer {i}")
+            change_status(session, owner, app.id, STATUSES[i % len(STATUSES)])
+
+    started = time.perf_counter()
+    with session_scope(engine) as session:
+        everything = list_applications(session, one)
+        filtered = list_applications(session, one, status="Interview", search="company 7")
+        by_company = list_applications(session, one, sort_by="company", descending=False)
+    elapsed = time.perf_counter() - started
+
+    assert len(everything) == 750 and len(by_company) == 750
+    assert all(a.status == "Interview" for a in filtered)
+    assert elapsed < 1.0  # the story allows 1 second for board and table to load
