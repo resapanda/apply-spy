@@ -3,7 +3,8 @@
 import argparse
 
 from apply_spy.db import init_db, make_engine, session_scope
-from apply_spy.profiles import create_profile, delete_profile, list_profiles
+from apply_spy.profiles import ProfileNotFound, create_profile, delete_profile, list_profiles
+from apply_spy.tracker import export_applications_csv
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -11,6 +12,9 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
 
     commands.add_parser("serve", help="start the local web UI")
+    export = commands.add_parser("export", help="export a profile's applications to CSV")
+    export.add_argument("id", type=int, help="profile id (see 'profile list')")
+    export.add_argument("--output", "-o", help="file to write (default: print to the screen)")
     profile = commands.add_parser("profile", help="manage profiles")
     profile_commands = profile.add_subparsers(dest="profile_command", required=True)
     add = profile_commands.add_parser("add", help="create a profile")
@@ -29,6 +33,8 @@ def main(argv: list[str] | None = None) -> int:
 
     engine = make_engine()
     init_db(engine)
+    if args.command == "export":
+        return _export(engine, args.id, args.output)
     if args.profile_command == "add":
         try:
             with session_scope(engine) as session:
@@ -43,6 +49,23 @@ def main(argv: list[str] | None = None) -> int:
         with session_scope(engine) as session:
             for p in list_profiles(session):
                 print(f"{p.id}\t{p.name}")
+    return 0
+
+
+def _export(engine, profile_id: int, output: str | None) -> int:
+    try:
+        with session_scope(engine) as session:
+            text = export_applications_csv(session, profile_id)
+    except ProfileNotFound as error:
+        print(f"Error: {error}")
+        return 1
+    if output is None:
+        print(text, end="")
+    else:
+        # newline="" so line breaks inside notes are written exactly as the csv module made them
+        with open(output, "w", encoding="utf-8", newline="") as file:
+            file.write(text)
+        print(f"Exported applications to {output}")
     return 0
 
 

@@ -1,5 +1,6 @@
 from apply_spy.tracker.service import (
     DEFAULT_STATUS,
+    EXPORT_COLUMNS,
     SORT_FIELDS,
     STATUSES,
     ApplicationNotFound,
@@ -7,6 +8,7 @@ from apply_spy.tracker.service import (
     InvalidStatus,
     change_status,
     create_application,
+    export_applications_csv,
     get_application,
     list_applications,
     list_status_events,
@@ -15,6 +17,7 @@ from apply_spy.tracker.service import (
 
 __all__ = [
     "DEFAULT_STATUS",
+    "EXPORT_COLUMNS",
     "SORT_FIELDS",
     "STATUSES",
     "ApplicationNotFound",
@@ -22,6 +25,7 @@ __all__ = [
     "InvalidStatus",
     "change_status",
     "create_application",
+    "export_applications_csv",
     "get_application",
     "list_applications",
     "list_status_events",

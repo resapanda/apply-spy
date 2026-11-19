@@ -4,6 +4,8 @@ Profile isolation: every function takes a profile_id and only ever touches
 that profile's rows.
 """
 
+import csv
+import io
 from datetime import date
 
 from sqlalchemy import case, func, select
@@ -272,3 +274,50 @@ def list_status_events(session: Session, profile_id: int, application_id: int) -
             .order_by(StatusEvent.id)
         )
     )
+
+
+# --- CSV export ---------------------------------------------------------
+
+# Header text and where each value comes from. This one list is the file's layout.
+EXPORT_COLUMNS = (
+    ("Company", "company"),
+    ("Title", "title"),
+    ("Link", "url"),
+    ("Location", "location"),
+    ("Salary range", "salary_range"),
+    ("Resume version", "resume_version"),
+    ("Status", "status"),
+    ("Date applied", "date_applied"),
+    ("Notes", "notes"),
+    ("Added", "created_at"),
+)
+
+# A spreadsheet treats a cell that starts with one of these as a formula.
+_FORMULA_STARTS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_cell(value) -> str:
+    if value is None:
+        return ""
+    text = value.isoformat() if hasattr(value, "isoformat") else str(value)
+    if text.startswith(_FORMULA_STARTS):
+        return "'" + text  # shown as plain text instead of being run as a formula
+    return text
+
+
+def export_applications_csv(session: Session, profile_id: int) -> str:
+    """All of this profile's applications as CSV text: a header row, then one
+    row per application, oldest first. Quotes and line breaks inside a value
+    (such as notes) are handled by Python's csv module.
+
+    Encode as UTF-8 when saving. Cells that start with = + - or @ get a leading
+    ' so a spreadsheet shows them as text rather than running them as formulas.
+    """
+    if session.get(Profile, profile_id) is None:
+        raise ProfileNotFound(f"No profile with id {profile_id}.")
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow([header for header, _ in EXPORT_COLUMNS])
+    for application in list_applications(session, profile_id, sort_by="created", descending=False):
+        writer.writerow([_csv_cell(getattr(application, field)) for _, field in EXPORT_COLUMNS])
+    return out.getvalue()
