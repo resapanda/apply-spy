@@ -2,6 +2,7 @@
 
 import html
 import json
+import re
 from contextlib import contextmanager
 from datetime import UTC, date
 
@@ -25,6 +26,7 @@ from apply_spy.tracker import (
     InvalidStatus,
     change_status,
     create_application,
+    export_applications_csv,
     get_application,
     list_applications,
     list_status_events,
@@ -145,7 +147,12 @@ def _board_html(applications) -> str:
 
 
 def _applications_content(profile_id: int | None) -> None:
-    ui.label("Applications").classes("text-lg mt-4")
+    with ui.row().classes("items-center gap-4 mt-4"):
+        ui.label("Applications").classes("text-lg")
+        if profile_id is not None:
+            ui.button("Export CSV", icon="download", on_click=lambda: export_csv()).props(
+                "flat data-testid=export-button"
+            )
     if profile_id is None:
         ui.label("Create a profile first, then add applications.")
         ui.link("Go to Profiles", "/profiles")
@@ -159,6 +166,15 @@ def _applications_content(profile_id: int | None) -> None:
         {"name": "date", "label": "Applied", "field": "date_applied", "align": "left"},
         {"name": "link", "label": "Link", "field": "url", "align": "left"},
     ]
+
+    def export_csv() -> None:
+        """Download all of this profile's applications (not just the filtered ones)."""
+        with session_scope(engine) as session:
+            text = export_applications_csv(session, profile_id)
+            name = get_active_profile(session, profile_id).name
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-").lower() or "profile"
+        filename = f"applications-{slug}-{date.today().isoformat()}.csv"
+        ui.download.content(text.encode("utf-8"), filename, "text/csv")
 
     def set_filter(name: str, value) -> None:
         app.storage.user[FILTERS_KEY] = {**_current_filters(), name: value}

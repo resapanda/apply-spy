@@ -1,10 +1,13 @@
+import csv
+import io
 import time
 from datetime import date, timedelta
 
 import pytest
 from sqlalchemy import select, text
 
-from apply_spy.db import Application, StatusEvent, session_scope
+from apply_spy.cli import main
+from apply_spy.db import Application, StatusEvent, init_db, make_engine, session_scope
 from apply_spy.profiles import ProfileNotFound, create_profile, delete_profile
 from apply_spy.tracker import (
     STATUSES,
@@ -13,6 +16,7 @@ from apply_spy.tracker import (
     InvalidStatus,
     change_status,
     create_application,
+    export_applications_csv,
     list_applications,
     list_status_events,
     update_application_details,
@@ -515,3 +519,153 @@ def test_1000_applications_load_and_filter_quickly(engine, two_profiles):
     assert len(everything) == 750 and len(by_company) == 750
     assert all(a.status == "Interview" for a in filtered)
     assert elapsed < 1.0  # the story allows 1 second for board and table to load
+
+
+# --- CSV export (story 3.1) ------------------------------------------------
+
+
+def _read_csv(text):
+    """Read the exported text back with Python's standard csv reader."""
+    return list(csv.reader(io.StringIO(text, newline="")))
+
+
+def test_export_has_a_header_naming_every_field_and_one_row_per_application(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        create_application(session, one, "Acme", "Engineer")
+        create_application(session, one, "Globex", "Developer")
+
+    with session_scope(engine) as session:
+        rows = _read_csv(export_applications_csv(session, one))
+    assert rows[0] == [
+        "Company",
+        "Title",
+        "Link",
+        "Location",
+        "Salary range",
+        "Resume version",
+        "Status",
+        "Date applied",
+        "Notes",
+        "Added",
+    ]
+    assert len(rows) == 3  # header + 2 applications
+    assert [r[0] for r in rows[1:]] == ["Acme", "Globex"]  # oldest first
+    assert all(len(r) == len(rows[0]) for r in rows)  # every row has every column
+
+
+def test_round_trip_keeps_commas_quotes_line_breaks_and_unicode(engine, two_profiles):
+    one, _ = two_profiles
+    notes = 'Said "call back, soon"\nSecond line\r\nThird, with comma'
+    with session_scope(engine) as session:
+        create_application(
+            session,
+            one,
+            "Café, Inc.",
+            'Engineer "II"',
+            "https://example.com/jobs?a=1&b=2",
+            location="Zürich, 日本",
+            salary_range="150k-180k",
+            resume_version="Backend v2",
+            notes=notes,
+            date_applied=date(2026, 11, 1),
+        )
+
+    with session_scope(engine) as session:
+        text = export_applications_csv(session, one)
+    # Saved as UTF-8 and read back as UTF-8, like a spreadsheet or another program would.
+    rows = _read_csv(text.encode("utf-8").decode("utf-8"))
+    record = dict(zip(rows[0], rows[1], strict=True))
+    assert record["Company"] == "Café, Inc."
+    assert record["Title"] == 'Engineer "II"'
+    assert record["Link"] == "https://example.com/jobs?a=1&b=2"
+    assert record["Location"] == "Zürich, 日本"
+    assert record["Notes"] == notes
+    assert record["Status"] == "Applied"
+    assert record["Date applied"] == "2026-11-01"
+    assert len(rows) == 2  # the line breaks in notes did not create extra rows
+
+
+def test_missing_optional_fields_are_empty_cells(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        create_application(session, one, "Acme", "Engineer")
+    with session_scope(engine) as session:
+        rows = _read_csv(export_applications_csv(session, one))
+    record = dict(zip(rows[0], rows[1], strict=True))
+    assert (record["Link"], record["Location"], record["Notes"]) == ("", "", "")
+
+
+def test_export_only_contains_that_profiles_applications(engine, two_profiles):
+    one, two = two_profiles
+    with session_scope(engine) as session:
+        create_application(session, one, "One Co", "Engineer")
+        create_application(session, two, "Two Co", "Engineer")
+    with session_scope(engine) as session:
+        companies = [r[0] for r in _read_csv(export_applications_csv(session, one))[1:]]
+    assert companies == ["One Co"]
+
+
+def test_export_for_a_profile_with_no_applications_is_just_the_header(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        assert len(_read_csv(export_applications_csv(session, one))) == 1
+
+
+def test_export_unknown_profile_is_an_error(engine):
+    with pytest.raises(ProfileNotFound):
+        with session_scope(engine) as session:
+            export_applications_csv(session, 999)
+
+
+@pytest.mark.parametrize("text", ["=1+1", "+1", "-2", "@SUM(A1)"])
+def test_cells_that_look_like_formulas_are_exported_as_text(engine, two_profiles, text):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        create_application(session, one, "Acme", "Engineer", notes=text)
+    with session_scope(engine) as session:
+        rows = _read_csv(export_applications_csv(session, one))
+    assert dict(zip(rows[0], rows[1], strict=True))["Notes"] == "'" + text
+
+
+def test_exporting_1000_applications_is_fast(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        for i in range(1000):
+            create_application(
+                session, one, f"Company {i}", f"Engineer {i}", notes="Line one\nLine, two"
+            )
+
+    started = time.perf_counter()
+    with session_scope(engine) as session:
+        text = export_applications_csv(session, one)
+    elapsed = time.perf_counter() - started
+
+    assert len(_read_csv(text)) == 1001
+    assert elapsed < 3.0  # the story allows 3 seconds
+
+
+def test_cli_export_writes_a_utf8_file_and_prints_to_the_screen(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("APPLY_SPY_DATA_DIR", str(tmp_path))
+    engine = make_engine()
+    init_db(engine)
+    with session_scope(engine) as session:
+        profile_id = create_profile(session, "Sample One").id
+        create_application(session, profile_id, "Café", "Engineer", notes="a, b\nc")
+    engine.dispose()
+
+    target = tmp_path / "out.csv"
+    assert main(["export", str(profile_id), "--output", str(target)]) == 0
+    with open(target, encoding="utf-8", newline="") as file:
+        rows = list(csv.reader(file))
+    assert rows[1][0] == "Café" and rows[1][8] == "a, b\nc"
+
+    capsys.readouterr()
+    assert main(["export", str(profile_id)]) == 0
+    assert _read_csv(capsys.readouterr().out)[1][0] == "Café"
+
+
+def test_cli_export_unknown_profile_is_an_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("APPLY_SPY_DATA_DIR", str(tmp_path))
+    assert main(["export", "999"]) == 1
+    assert "No profile with id 999" in capsys.readouterr().out
