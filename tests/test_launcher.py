@@ -130,7 +130,7 @@ def _stub(folder, name, body):
 
 
 def run_launcher(
-    tmp_path, project, *, server_up_at_start, server_ever_starts, tries="3", apple_chip=True
+    tmp_path, project, *, server_up_at_start, server_ever_starts, tries="40", apple_chip=True
 ):
     bin_dir = tmp_path / "stubs"
     bin_dir.mkdir()
@@ -188,8 +188,10 @@ def test_on_an_intel_mac_it_does_not_force_an_architecture(tmp_path, project):
 
 
 def test_when_it_cannot_start_it_shows_an_error_instead_of_failing_silently(tmp_path, project):
+    # A short wait here, so the "never starts" case fails fast. The success cases use a long
+    # wait: the script stops waiting as soon as the stand-in server answers, so it costs nothing.
     code, calls = run_launcher(
-        tmp_path, project, server_up_at_start=False, server_ever_starts=False
+        tmp_path, project, server_up_at_start=False, server_ever_starts=False, tries="3"
     )
     assert code == 1
     assert calls[-1] == "osascript alert"
