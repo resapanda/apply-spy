@@ -40,3 +40,18 @@ def create_profile(session: Session, name: str) -> Profile:
 
 def list_profiles(session: Session) -> list[Profile]:
     return list(session.scalars(select(Profile).order_by(Profile.created_at, Profile.id)))
+
+
+def get_active_profile(session: Session, profile_id: int | None) -> Profile | None:
+    """Return the profile the user picked, or fall back to the first one.
+
+    The fallback covers a first visit (nothing picked yet) and a stored id
+    that no longer exists (for example a deleted profile). Returns None only
+    when there are no profiles at all.
+    """
+    if profile_id is not None:
+        profile = session.get(Profile, profile_id)
+        if profile is not None:
+            return profile
+    profiles = list_profiles(session)
+    return profiles[0] if profiles else None
