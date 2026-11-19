@@ -197,9 +197,16 @@ def _extract_checked(archive: Path, scratch: Path) -> tuple[dict, CheckResult]:
                 shutil.copyfileobj(source, out)
 
     result = check_database(scratch / DATABASE_FILENAME)
-    if not result.ok:
+    # A backup made by an older version has no tables that were added later. That is fine:
+    # the app creates them the next time it starts. A table the manifest lists, though,
+    # must be there.
+    expected = manifest.get("counts")
+    missing_but_expected = [
+        t for t in result.missing_tables if isinstance(expected, dict) and t in expected
+    ]
+    if not (result.integrity_ok and result.foreign_keys_ok) or missing_but_expected:
         raise InvalidBackup("The database inside the backup failed its integrity check.")
-    if result.counts != manifest.get("counts"):
+    if result.counts != expected:
         raise InvalidBackup("The row counts in the backup do not match its manifest.")
     return manifest, result
 

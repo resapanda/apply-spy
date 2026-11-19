@@ -7,7 +7,7 @@ data stays separate (see AGENTS.md, "Profile isolation").
 from datetime import UTC, date, datetime
 
 from sqlalchemy import Date, DateTime, ForeignKey, Index, String, Text, TypeDecorator, func
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(DeclarativeBase):
@@ -93,3 +93,25 @@ class StatusEvent(Base):
     changed_at: Mapped[datetime] = mapped_column(
         UTCDateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
+
+
+class CompletedFollowUp(Base):
+    """A follow-up that was marked complete: what it was for, and when it was done.
+
+    Owned by an application (so by that application's profile). Deleting the
+    application or its profile deletes these too.
+    """
+
+    __tablename__ = "completed_follow_ups"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id", ondelete="CASCADE"), index=True
+    )
+    due_date: Mapped[date] = mapped_column(Date)
+    label: Mapped[str | None] = mapped_column(String(100))
+    completed_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+    # Loaded together with the row, so it is still readable after the session closes.
+    application: Mapped["Application"] = relationship(lazy="joined")
