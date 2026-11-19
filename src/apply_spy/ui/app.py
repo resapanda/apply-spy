@@ -10,7 +10,7 @@ from datetime import UTC, date
 from nicegui import app, ui
 
 from apply_spy.backup import BackupError, check_database, create_backup
-from apply_spy.config import DATABASE_FILENAME, data_dir
+from apply_spy.config import DATABASE_FILENAME, PORT, data_dir
 from apply_spy.db import init_db, make_engine, session_scope
 from apply_spy.profiles import (
     ConfirmationRequired,
@@ -46,6 +46,27 @@ init_db(engine)
 
 ACTIVE_PROFILE_KEY = "active_profile_id"
 
+# Shown over the page when the user quits. It is plain text only (no user data), covers
+# everything including NiceGUI's own "Connection lost" box, and stops reconnect attempts.
+STOPPED_PAGE_JS = """
+(() => {
+  try { window.socket.io.reconnection(false); } catch (error) {}
+  document.title = "apply-spy stopped";
+  const box = document.createElement("div");
+  box.setAttribute("data-testid", "stopped-overlay");
+  box.style.cssText = "position:fixed;inset:0;z-index:2147483647;background:Canvas;" +
+    "color:CanvasText;font-family:system-ui,sans-serif;display:flex;flex-direction:column;" +
+    "align-items:center;justify-content:center;text-align:center;";
+  box.innerHTML = "<div style='font-size:28px;font-weight:600;margin-bottom:12px'>" +
+    "apply-spy has stopped</div>" +
+    "<div style='font-size:16px;margin:4px 0'>" +
+    "Your data is saved. You can close this tab.</div>" +
+    "<div style='font-size:16px;margin:4px 0'>" +
+    "To use apply-spy again, click the apply-spy icon.</div>";
+  document.body.appendChild(box);
+})();
+"""
+
 
 @contextmanager
 def page_layout():
@@ -62,6 +83,29 @@ def page_layout():
         app.storage.user[ACTIVE_PROFILE_KEY] = event.value
         ui.navigate.reload()  # reload so everything on the page uses the new profile
 
+    def confirm_quit() -> None:
+        with ui.dialog() as dialog, ui.card():
+            ui.label("Quit apply-spy?").classes("text-lg font-bold")
+            ui.label("Your data is saved. Click the apply-spy icon to start it again.")
+
+            async def quit_app() -> None:
+                dialog.close()
+                # Cover the page with a clear message BEFORE the server goes away. Once it
+                # is gone it cannot send anything, and the browser would only show a
+                # frozen page with "Connection lost".
+                try:
+                    await ui.run_javascript(STOPPED_PAGE_JS, timeout=3)
+                except TimeoutError:
+                    pass  # no browser answered; shut down anyway
+                app.shutdown()
+
+            with ui.row():
+                ui.button("Cancel", on_click=dialog.close).props("flat")
+                ui.button("Quit", color="negative", on_click=quit_app).props(
+                    "data-testid=confirm-quit"
+                )
+        dialog.open()
+
     with ui.header().classes("items-center justify-between"):
         with ui.row().classes("items-center gap-4"):
             ui.label("apply-spy").classes("text-xl font-bold")
@@ -69,12 +113,16 @@ def page_layout():
             ui.link("Applications", "/applications").classes("text-white")
             ui.link("Profiles", "/profiles").classes("text-white")
             ui.link("Data", "/data").classes("text-white")
-        if profiles:
-            ui.select(
-                dict(profiles), value=active_id, label="Active profile", on_change=switch
-            ).props("data-testid=profile-switcher dense")
-        else:
-            ui.label("No profile yet").props("data-testid=profile-switcher")
+        with ui.row().classes("items-center gap-2"):
+            if profiles:
+                ui.select(
+                    dict(profiles), value=active_id, label="Active profile", on_change=switch
+                ).props("data-testid=profile-switcher dense")
+            else:
+                ui.label("No profile yet").props("data-testid=profile-switcher")
+            ui.button(icon="power_settings_new", on_click=confirm_quit).props(
+                "flat round dense color=white data-testid=quit-button"
+            ).tooltip("Quit apply-spy")
     yield active_id
 
 
@@ -943,6 +991,7 @@ def run() -> None:
     ui.run(
         title="apply-spy",
         host="127.0.0.1",
+        port=PORT,
         reload=False,
         show=True,
         storage_secret="apply-spy-local",
