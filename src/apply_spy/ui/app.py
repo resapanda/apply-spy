@@ -8,6 +8,8 @@ from datetime import UTC, date
 
 from nicegui import app, ui
 
+from apply_spy.backup import BackupError, check_database, create_backup
+from apply_spy.config import DATABASE_FILENAME, data_dir
 from apply_spy.db import init_db, make_engine, session_scope
 from apply_spy.profiles import (
     ConfirmationRequired,
@@ -60,6 +62,7 @@ def page_layout():
             ui.label("apply-spy").classes("text-xl font-bold")
             ui.link("Applications", "/").classes("text-white")
             ui.link("Profiles", "/profiles").classes("text-white")
+            ui.link("Data", "/data").classes("text-white")
         if profiles:
             ui.select(
                 dict(profiles), value=active_id, label="Active profile", on_change=switch
@@ -79,6 +82,12 @@ def applications_page() -> None:
 def application_page(application_id: int) -> None:
     with page_layout() as active_id:
         _application_detail_content(active_id, application_id)
+
+
+@ui.page("/data")
+def data_page() -> None:
+    with page_layout():
+        _data_content()
 
 
 @ui.page("/profiles")
@@ -443,6 +452,60 @@ def _application_detail_content(profile_id: int | None, application_id: int) -> 
         list(STATUSES), value=application.status, label="Status", on_change=on_status_change
     ).props("data-testid=status-select").classes("w-64 mt-4")
     history()
+
+
+def _data_content() -> None:
+    ui.label("Your data").classes("text-lg mt-4")
+    ui.label(
+        "Everything lives on this computer. A backup is one zip file with all profiles, "
+        "applications and resumes, so keep a copy somewhere safe (a USB stick or a cloud folder)."
+    ).classes("max-w-2xl")
+
+    saved = ui.label("").props("data-testid=backup-saved")
+
+    def back_up_now() -> None:
+        try:
+            archive, _ = create_backup(data_dir())
+        except BackupError as error:
+            ui.notify(str(error), type="negative")
+            return
+        saved.set_text(f"A copy was also saved on this computer: {archive}")
+        ui.download.file(archive, archive.name, "application/zip")
+        ui.notify("Backup created", type="positive")
+        health.refresh()
+
+    ui.button("Back up now", icon="backup", on_click=back_up_now).props(
+        "data-testid=backup-button"
+    ).classes("mt-2")
+
+    ui.label("Database check").classes("text-lg mt-6")
+
+    @ui.refreshable
+    def health() -> None:
+        try:
+            result = check_database(data_dir() / DATABASE_FILENAME)
+        except BackupError as error:
+            ui.label(str(error))
+            return
+        for table, count in result.counts.items():
+            ui.label(f"{table}: {count}")
+        for table in result.missing_tables:
+            ui.label(f"Missing table: {table}").classes("text-negative")
+        ok = result.ok
+        ui.label(
+            "Integrity and foreign keys: ok" if ok else "Problems found: see the terminal"
+        ).classes("text-positive" if ok else "text-negative").props("data-testid=health")
+
+    health()
+    ui.button("Check again", on_click=health.refresh).props("flat")
+
+    ui.label("Restoring a backup").classes("text-lg mt-6")
+    ui.label(
+        "Restoring replaces your data, so it is done from a terminal with this app stopped. "
+        "If data already exists you are asked to confirm, and the old data is moved aside, "
+        "not deleted."
+    ).classes("max-w-2xl")
+    ui.code("uv run apply-spy restore PATH/TO/backup.zip", language="bash")
 
 
 def _profiles_content() -> None:

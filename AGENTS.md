@@ -15,7 +15,7 @@ Work items live in GitHub Issues (one per user story, grouped by sprint mileston
 
 ## Current status
 
-Sprint 1 (v0.1) in progress. Done: stories 1.1 (create a profile), 1.2 (switch the active profile), 1.3 (delete a profile) and 2.1 (add an application: tables, tracker service, quick-add form and a simple list; the board and table views are story 2.3). Update this section as the project moves.
+Sprint 1 (v0.1) in progress. Done: profiles (1.1-1.3), the application tracker (2.1-2.3: quick-add, status changes with history, editing, filters, search, sort, table and board views), CSV export (3.1) and backup and restore (3.2). Still to do in Sprint 1: follow-up reminders (4.1, 4.2). Update this section as the project moves.
 
 ## Decisions already made (do not re-ask)
 
@@ -57,6 +57,10 @@ uv run ruff format .           # format
 uv run apply-spy serve         # web UI at http://localhost:8080
 uv run apply-spy profile add NAME   # CLI: create a profile
 uv run apply-spy profile list       # CLI: list profiles
+uv run apply-spy export ID -o FILE  # CLI: export a profile's applications to CSV
+uv run apply-spy backup             # save a timestamped zip of all data (data/backups)
+uv run apply-spy restore FILE.zip   # restore a backup (asks before replacing data)
+uv run apply-spy check              # database self-check: row counts and integrity
 ```
 
 Set `APPLY_SPY_DATA_DIR` to use a different data folder (handy for experiments and tests).
