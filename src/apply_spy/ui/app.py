@@ -1,5 +1,6 @@
 """Local web UI (NiceGUI). No business logic here: it calls the service layer."""
 
+import html
 import json
 from contextlib import contextmanager
 from datetime import UTC, date
@@ -17,6 +18,7 @@ from apply_spy.profiles import (
     list_profiles,
 )
 from apply_spy.tracker import (
+    SORT_FIELDS,
     STATUSES,
     ApplicationNotFound,
     InvalidApplication,
@@ -83,6 +85,65 @@ def profiles_page() -> None:
         _profiles_content()
 
 
+FILTERS_KEY = "application_filters"
+DEFAULT_FILTERS = {
+    "status": "All",
+    "search": "",
+    "sort_by": "created",
+    "descending": True,
+    "view": "Table",
+}
+SORT_LABELS = {
+    "created": "Newest added",
+    "date_applied": "Date applied",
+    "company": "Company",
+    "status": "Status",
+}
+
+
+def _current_filters() -> dict:
+    """The filters kept for this browser session, cleaned of anything stale."""
+    saved = {**DEFAULT_FILTERS, **(app.storage.user.get(FILTERS_KEY) or {})}
+    if saved["status"] != "All" and saved["status"] not in STATUSES:
+        saved["status"] = "All"
+    if saved["sort_by"] not in SORT_FIELDS:
+        saved["sort_by"] = DEFAULT_FILTERS["sort_by"]
+    if saved["view"] not in ("Table", "Board"):
+        saved["view"] = "Table"
+    saved["search"] = str(saved["search"] or "")
+    saved["descending"] = bool(saved["descending"])
+    return saved
+
+
+def _board_html(applications) -> str:
+    """The board as one HTML block (much lighter than thousands of widgets).
+
+    Everything shown is escaped, and the only link is to our own detail page.
+    """
+    by_status = {name: [] for name in STATUSES}
+    for a in applications:
+        by_status[a.status].append(a)
+    columns = []
+    for name, cards in by_status.items():
+        items = "".join(
+            f'<div style="border:1px solid rgba(128,128,128,.4);border-radius:6px;'
+            f'padding:6px;margin-top:6px"><a href="/applications/{a.id}" '
+            f'style="font-weight:600;text-decoration:underline">{html.escape(a.company)}</a>'
+            f"<div>{html.escape(a.title)}</div>"
+            f'<div style="opacity:.7;font-size:.85em">{a.date_applied.isoformat()}</div></div>'
+            for a in cards
+        )
+        columns.append(
+            '<div style="min-width:220px;max-width:220px;background:rgba(128,128,128,.12);'
+            f'border-radius:8px;padding:8px"><b>{html.escape(name)}</b> '
+            f'<span style="opacity:.7">({len(cards)})</span>{items}</div>'
+        )
+    return (
+        '<div data-testid="board" style="display:flex;gap:12px;overflow-x:auto;'
+        f'align-items:flex-start">{"".join(columns)}</div>'
+    )
+
+
 def _applications_content(profile_id: int | None) -> None:
     ui.label("Applications").classes("text-lg mt-4")
     if profile_id is None:
@@ -99,9 +160,28 @@ def _applications_content(profile_id: int | None) -> None:
         {"name": "link", "label": "Link", "field": "url", "align": "left"},
     ]
 
+    def set_filter(name: str, value) -> None:
+        app.storage.user[FILTERS_KEY] = {**_current_filters(), name: value}
+        results.refresh()
+
+    def clear_filters() -> None:
+        app.storage.user[FILTERS_KEY] = {**_current_filters(), "status": "All", "search": ""}
+        ui.navigate.reload()  # simplest way to reset the controls to match
+
     @ui.refreshable
-    def table() -> None:
+    def results() -> None:
+        filters = _current_filters()
+        is_filtered = filters["status"] != "All" or bool(filters["search"].strip())
         with session_scope(engine) as session:
+            found = list_applications(
+                session,
+                profile_id,
+                status=None if filters["status"] == "All" else filters["status"],
+                search=filters["search"],
+                sort_by=filters["sort_by"],
+                descending=filters["descending"],
+            )
+            # Plain values only, so nothing touches the database after this block.
             rows = [
                 {
                     "id": a.id,
@@ -112,12 +192,28 @@ def _applications_content(profile_id: int | None) -> None:
                     "date_applied": a.date_applied.isoformat(),
                     "url": a.url or "",
                 }
-                for a in list_applications(session, profile_id)
+                for a in found
             ]
+            board = _board_html(found) if filters["view"] == "Board" else ""
         if not rows:
-            ui.label("No applications yet. Add your first one above.").props("data-testid=empty")
+            message = (
+                "No applications match these filters."
+                if is_filtered
+                else "No applications yet. Add your first one above."
+            )
+            ui.label(message).props("data-testid=empty")
             return
-        grid = ui.table(columns=columns, rows=rows, row_key="id").props("data-testid=applications")
+        ui.label(f"Showing {len(rows)} application{'s' if len(rows) != 1 else ''}").classes(
+            "text-sm opacity-70"
+        ).props("data-testid=count")
+
+        if filters["view"] == "Board":
+            ui.html(board, sanitize=False)
+            return
+
+        grid = ui.table(columns=columns, rows=rows, row_key="id", pagination=50).props(
+            "data-testid=applications"
+        )
         grid.add_slot(
             "body-cell-company",
             '<q-td :props="props"><a :href="\'/applications/\' + props.row.id" '
@@ -149,7 +245,7 @@ def _applications_content(profile_id: int | None) -> None:
             ui.notify(str(error), type="negative")
         else:
             ui.notify(f"Status: {event.args['status']}", type="positive")
-        table.refresh()  # shows the saved value (or puts the old one back after an error)
+        results.refresh()  # shows the saved value (or puts the old one back after an error)
 
     def submit() -> None:
         try:
@@ -171,7 +267,7 @@ def _applications_content(profile_id: int | None) -> None:
         for field in (company, title, url, location, salary, resume, notes):
             field.value = ""
         ui.notify("Application added", type="positive")
-        table.refresh()
+        results.refresh()
 
     with ui.row().classes("items-start gap-2"):
         company = ui.input("Company").props("data-testid=company-input").on("keydown.enter", submit)
@@ -187,7 +283,40 @@ def _applications_content(profile_id: int | None) -> None:
             resume = ui.input("Resume version")
         notes = ui.textarea("Notes").classes("w-full")
 
-    table()
+    # Filters, search, sort and view. They are remembered for this browser session, so
+    # opening an application and coming back shows the same results.
+    filters = _current_filters()
+    with ui.row().classes("items-center gap-2 mt-4"):
+        ui.select(
+            ["All", *STATUSES],
+            value=filters["status"],
+            label="Status",
+            on_change=lambda e: set_filter("status", e.value),
+        ).props("data-testid=filter-status").classes("w-48")
+        ui.input(
+            "Search company, title, location",
+            value=filters["search"],
+            on_change=lambda e: set_filter("search", e.value or ""),
+        ).props("clearable debounce=300 data-testid=filter-search").classes("w-72")
+        ui.select(
+            SORT_LABELS,
+            value=filters["sort_by"],
+            label="Sort by",
+            on_change=lambda e: set_filter("sort_by", e.value),
+        ).props("data-testid=sort-by").classes("w-44")
+        ui.toggle(
+            {True: "Descending", False: "Ascending"},
+            value=filters["descending"],
+            on_change=lambda e: set_filter("descending", e.value),
+        )
+        ui.toggle(
+            ["Table", "Board"],
+            value=filters["view"],
+            on_change=lambda e: set_filter("view", e.value),
+        ).props("data-testid=view-toggle")
+        ui.button("Clear filters", on_click=clear_filters).props("flat")
+
+    results()
 
 
 def _application_detail_content(profile_id: int | None, application_id: int) -> None:

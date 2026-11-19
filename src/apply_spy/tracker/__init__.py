@@ -1,5 +1,6 @@
 from apply_spy.tracker.service import (
     DEFAULT_STATUS,
+    SORT_FIELDS,
     STATUSES,
     ApplicationNotFound,
     InvalidApplication,
@@ -14,6 +15,7 @@ from apply_spy.tracker.service import (
 
 __all__ = [
     "DEFAULT_STATUS",
+    "SORT_FIELDS",
     "STATUSES",
     "ApplicationNotFound",
     "InvalidApplication",
