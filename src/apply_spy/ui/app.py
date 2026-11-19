@@ -14,6 +14,7 @@ from apply_spy.profiles import (
     get_active_profile,
     list_profiles,
 )
+from apply_spy.tracker import InvalidApplication, create_application, list_applications
 
 engine = make_engine()
 init_db(engine)
@@ -38,7 +39,10 @@ def page_layout():
         ui.navigate.reload()  # reload so everything on the page uses the new profile
 
     with ui.header().classes("items-center justify-between"):
-        ui.label("apply-spy").classes("text-xl font-bold")
+        with ui.row().classes("items-center gap-4"):
+            ui.label("apply-spy").classes("text-xl font-bold")
+            ui.link("Applications", "/").classes("text-white")
+            ui.link("Profiles", "/profiles").classes("text-white")
         if profiles:
             ui.select(
                 dict(profiles), value=active_id, label="Active profile", on_change=switch
@@ -49,9 +53,96 @@ def page_layout():
 
 
 @ui.page("/")
+def applications_page() -> None:
+    with page_layout() as active_id:
+        _applications_content(active_id)
+
+
+@ui.page("/profiles")
 def profiles_page() -> None:
     with page_layout():
         _profiles_content()
+
+
+def _applications_content(profile_id: int | None) -> None:
+    ui.label("Applications").classes("text-lg mt-4")
+    if profile_id is None:
+        ui.label("Create a profile first, then add applications.")
+        ui.link("Go to Profiles", "/profiles")
+        return
+
+    columns = [
+        {"name": "company", "label": "Company", "field": "company", "align": "left"},
+        {"name": "title", "label": "Title", "field": "title", "align": "left"},
+        {"name": "location", "label": "Location", "field": "location", "align": "left"},
+        {"name": "status", "label": "Status", "field": "status", "align": "left"},
+        {"name": "date", "label": "Applied", "field": "date_applied", "align": "left"},
+        {"name": "link", "label": "Link", "field": "url", "align": "left"},
+    ]
+
+    @ui.refreshable
+    def table() -> None:
+        with session_scope(engine) as session:
+            rows = [
+                {
+                    "id": a.id,
+                    "company": a.company,
+                    "title": a.title,
+                    "location": a.location or "",
+                    "status": a.status,
+                    "date_applied": a.date_applied.isoformat(),
+                    "url": a.url or "",
+                }
+                for a in list_applications(session, profile_id)
+            ]
+        if not rows:
+            ui.label("No applications yet. Add your first one above.").props("data-testid=empty")
+            return
+        grid = ui.table(columns=columns, rows=rows, row_key="id").props("data-testid=applications")
+        # Links are checked to be http(s) by the service before they are saved.
+        grid.add_slot(
+            "body-cell-link",
+            '<q-td :props="props"><a v-if="props.value" :href="props.value" '
+            'target="_blank" rel="noopener">Open</a></q-td>',
+        )
+
+    def submit() -> None:
+        try:
+            with session_scope(engine) as session:
+                create_application(
+                    session,
+                    profile_id,
+                    company.value,
+                    title.value,
+                    url.value,
+                    location=location.value,
+                    salary_range=salary.value,
+                    resume_version=resume.value,
+                    notes=notes.value,
+                )
+        except InvalidApplication as error:
+            ui.notify(str(error), type="negative")
+            return
+        for field in (company, title, url, location, salary, resume, notes):
+            field.value = ""
+        ui.notify("Application added", type="positive")
+        table.refresh()
+
+    with ui.row().classes("items-start gap-2"):
+        company = ui.input("Company").props("data-testid=company-input").on("keydown.enter", submit)
+        title = ui.input("Title").props("data-testid=title-input").on("keydown.enter", submit)
+        url = (
+            ui.input("Link (optional)").props("data-testid=link-input").on("keydown.enter", submit)
+        )
+        ui.button("Add application", on_click=submit).props("data-testid=add-button")
+    with ui.expansion("More details (optional)").classes("w-full"):
+        with ui.row().classes("gap-2"):
+            location = ui.input("Location")
+            salary = ui.input("Salary range")
+            resume = ui.input("Resume version")
+        notes = ui.textarea("Notes").classes("w-full")
+
+    table()
 
 
 def _profiles_content() -> None:
