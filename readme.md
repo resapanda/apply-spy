@@ -79,7 +79,7 @@ apply-spy/
 │   ├── tracker/     # applications, stages, reminders
 │   ├── sources/     # job source fetchers
 │   ├── matching/    # filters, embeddings, scoring
-│   ├── ui/          # local web UI
+│   ├── ui/          # local web UI: layout, theme, dialogs, pages/
 │   ├── backup.py    # backup, restore and database self-check
 │   ├── launcher.py  # the macOS app icon (`apply-spy install-icon`)
 │   ├── config.py    # where the data lives

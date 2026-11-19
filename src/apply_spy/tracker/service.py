@@ -469,13 +469,14 @@ def list_applications(
     search: str | None = None,
     sort_by: str = "created",
     descending: bool = True,
+    limit: int | None = None,
 ) -> list[Application]:
     """This profile's applications. The table and the board both use this.
 
     status: only this status. search: case-insensitive text found in the
     company, title or location (% and _ are treated as plain characters).
     sort_by: one of SORT_FIELDS; "status" sorts in pipeline order (Saved first).
-    The default is newest-added first.
+    The default is newest-added first. limit: at most this many (after sorting).
     """
     if status is not None and status not in STATUSES:
         raise InvalidStatus(f"Unknown status: {status!r}.")
@@ -503,6 +504,8 @@ def list_applications(
     primary = column.desc() if descending else column.asc()
     # Ties: the most recently added first, so the order is always predictable.
     query = query.order_by(primary, Application.created_at.desc(), Application.id.desc())
+    if limit is not None:
+        query = query.limit(limit)
     return list(session.scalars(query))
 
 

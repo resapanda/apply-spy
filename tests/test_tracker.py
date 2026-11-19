@@ -1471,3 +1471,14 @@ def test_upcoming_and_later_are_per_profile(engine, two_profiles):
         assert _names(upcoming_follow_ups(session, one, today=TODAY)) == ["One Co"]
         assert _names(later_follow_ups(session, one, today=TODAY)) == []
         assert _names(later_follow_ups(session, two, today=TODAY)) == ["Two Far"]
+
+
+def test_list_applications_can_be_limited(engine, two_profiles):
+    one, _ = two_profiles
+    with session_scope(engine) as session:
+        for name in ("First", "Second", "Third", "Fourth"):
+            create_application(session, one, name, "Engineer")
+    with session_scope(engine) as session:
+        assert [a.company for a in list_applications(session, one, limit=2)] == ["Fourth", "Third"]
+        assert [a.company for a in list_applications(session, one, limit=None)][0] == "Fourth"
+        assert len(list_applications(session, one, limit=10)) == 4
