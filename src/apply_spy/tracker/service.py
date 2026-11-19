@@ -30,8 +30,18 @@ MAX_SHORT = 200
 MAX_URL = 2000
 MAX_SALARY = 100
 
-# Fields that can be filled in later with update_application_details.
-EDITABLE_FIELDS = ("url", "location", "salary_range", "resume_version", "notes")
+# Fields that can be changed later with update_application_details.
+# Everything except status, which must go through change_status so history is written.
+EDITABLE_FIELDS = (
+    "company",
+    "title",
+    "url",
+    "location",
+    "salary_range",
+    "resume_version",
+    "notes",
+    "date_applied",
+)
 
 
 class InvalidApplication(ValueError):
@@ -44,6 +54,10 @@ class InvalidApplication(ValueError):
 
 class ApplicationNotFound(LookupError):
     """No application with this id in this profile."""
+
+
+class InvalidStatus(ValueError):
+    """The status is not one of STATUSES."""
 
 
 def _short_text(value: str | None) -> str | None:
@@ -127,35 +141,38 @@ def create_application(
 
 
 def update_application_details(
-    session: Session, profile_id: int, application_id: int, **fields: str | None
+    session: Session, profile_id: int, application_id: int, **fields: str | date | None
 ) -> Application:
-    """Fill in or change optional details later (link, location, salary range,
-    resume version, notes). Fields not passed are left as they are."""
+    """Change any detail of an application (not its status).
+
+    Fields not passed are left as they are. Every value is checked before
+    anything is changed, so a bad value changes nothing.
+    """
     unknown = set(fields) - set(EDITABLE_FIELDS)
     if unknown:
         raise ValueError(f"Cannot edit: {', '.join(sorted(unknown))}")
-    application = session.scalar(
-        select(Application).where(
-            Application.id == application_id, Application.profile_id == profile_id
-        )
-    )
-    if application is None:
-        raise ApplicationNotFound(f"No application with id {application_id} in this profile.")
+    application = get_application(session, profile_id, application_id)
 
-    if "url" in fields:
-        application.url = _url(fields["url"])
-    if "location" in fields:
-        application.location = _optional("Location", "location", fields["location"], MAX_SHORT)
-    if "salary_range" in fields:
-        application.salary_range = _optional(
-            "Salary range", "salary range", fields["salary_range"], MAX_SALARY
-        )
-    if "resume_version" in fields:
-        application.resume_version = _optional(
-            "Resume version", "resume version", fields["resume_version"], MAX_SHORT
-        )
-    if "notes" in fields:
-        application.notes = _notes(fields["notes"])
+    cleaners = {
+        "company": lambda v: _required("Company", v),
+        "title": lambda v: _required("Title", v),
+        "url": _url,
+        "location": lambda v: _optional("Location", "location", v, MAX_SHORT),
+        "salary_range": lambda v: _optional("Salary range", "salary range", v, MAX_SALARY),
+        "resume_version": lambda v: _optional("Resume version", "resume version", v, MAX_SHORT),
+        "notes": _notes,
+    }
+    cleaned = {}
+    for name, value in fields.items():
+        if name == "date_applied":
+            if not isinstance(value, date):
+                raise InvalidApplication("date applied", "Date applied is required.")
+            cleaned[name] = value
+        else:
+            cleaned[name] = cleaners[name](value)
+
+    for name, value in cleaned.items():
+        setattr(application, name, value)
     session.flush()
     return application
 
@@ -167,5 +184,54 @@ def list_applications(session: Session, profile_id: int) -> list[Application]:
             select(Application)
             .where(Application.profile_id == profile_id)
             .order_by(Application.created_at.desc(), Application.id.desc())
+        )
+    )
+
+
+def get_application(session: Session, profile_id: int, application_id: int) -> Application:
+    """One application, but only if it belongs to this profile."""
+    application = session.scalar(
+        select(Application).where(
+            Application.id == application_id, Application.profile_id == profile_id
+        )
+    )
+    if application is None:
+        raise ApplicationNotFound(f"No application with id {application_id} in this profile.")
+    return application
+
+
+def change_status(
+    session: Session, profile_id: int, application_id: int, new_status: str
+) -> Application:
+    """Move an application to a new status. The ONLY place a status changes.
+
+    The new status and its history event are written in the caller's single
+    transaction (session_scope), so they succeed or fail together. Choosing the
+    status it already has changes nothing and adds no event.
+    """
+    if new_status not in STATUSES:
+        raise InvalidStatus(f"Unknown status: {new_status!r}.")
+    application = get_application(session, profile_id, application_id)
+    if application.status == new_status:
+        return application
+
+    old_status = application.status
+    application.status = new_status
+    session.add(
+        StatusEvent(application_id=application.id, old_status=old_status, new_status=new_status)
+    )
+    session.flush()
+    return application
+
+
+def list_status_events(session: Session, profile_id: int, application_id: int) -> list[StatusEvent]:
+    """The application's history, oldest first. Includes the first event
+    (no old status) that records the application being added."""
+    application = get_application(session, profile_id, application_id)
+    return list(
+        session.scalars(
+            select(StatusEvent)
+            .where(StatusEvent.application_id == application.id)
+            .order_by(StatusEvent.id)
         )
     )
