@@ -1,0 +1,32 @@
+[project]
+name = "apply-spy"
+version = "0.1.0"
+description = "Local-first job application tracker and job matcher"
+requires-python = ">=3.12"
+dependencies = [
+    "nicegui>=4.0.0",
+    "sqlalchemy>=2.1.9",
+]
+
+[project.scripts]
+apply-spy = "apply_spy.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.9,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.5",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

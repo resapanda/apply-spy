@@ -15,13 +15,13 @@ Work items live in GitHub Issues (one per user story, grouped by sprint mileston
 
 ## Current status
 
-Planning is done; no code exists yet. The first task is scaffolding the project for Sprint 1 (v0.1). Update this section as the project moves.
+Sprint 1 (v0.1) in progress. Scaffold and story 1.1 (create a profile) exist: SQLite models, profile service, CLI and a NiceGUI page. Update this section as the project moves.
 
 ## Decisions already made (do not re-ask)
 
 - Language: Python 3.12+, managed with `uv`.
 - Storage: SQLite via SQLAlchemy, in a local `data/` folder (gitignored).
-- UI: local web UI, with a CLI as a secondary interface. Framework (NiceGUI or Streamlit) is chosen at v0.1; ask if not yet decided in this file.
+- UI: local web UI with NiceGUI, with a CLI as a secondary interface. The server must bind to 127.0.0.1 only.
 - Everything works offline except job fetching. No telemetry.
 - LLM features are optional and off by default; the core must work without them. Never send resume text anywhere without an explicit opt-in.
 - No visa sponsorship filtering. Locations: Seattle area and Mountain View area.
@@ -49,15 +49,17 @@ Planning is done; no code exists yet. The first task is scaffolding the project 
 
 ## Commands
 
-Fill these in when the scaffold exists. Expected:
-
 ```bash
-uv sync                 # install dependencies
-uv run pytest           # run tests
-uv run ruff check .     # lint
-uv run ruff format .    # format
-uv run apply-spy --help # CLI
+uv sync                        # install dependencies
+uv run pytest                  # run tests
+uv run ruff check .            # lint
+uv run ruff format .           # format
+uv run apply-spy serve         # web UI at http://localhost:8080
+uv run apply-spy profile add NAME   # CLI: create a profile
+uv run apply-spy profile list       # CLI: list profiles
 ```
+
+Set `APPLY_SPY_DATA_DIR` to use a different data folder (handy for experiments and tests).
 
 ## Git and PR conventions
 
