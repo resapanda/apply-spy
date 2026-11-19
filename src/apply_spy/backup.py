@@ -17,11 +17,14 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
-from apply_spy.config import DATABASE_FILENAME
+from apply_spy.config import DATABASE_FILENAME, LOG_FILENAME, NICEGUI_DIRNAME
 from apply_spy.db.models import Base
 
 RESUMES_DIR = "resumes"
 BACKUPS_DIR = "backups"  # default place for archives; never part of an archive
+# Things in the data folder that are not your data: they never count as "existing data"
+# and a restore leaves them where they are.
+NOT_DATA = (BACKUPS_DIR, NICEGUI_DIRNAME, LOG_FILENAME)
 MANIFEST = "manifest.json"
 FORMAT_VERSION = 1
 
@@ -80,8 +83,9 @@ def check_database(db_path: Path) -> CheckResult:
 
 
 def has_live_data(data_dir: Path) -> bool:
-    """True if the data folder holds anything other than saved backups."""
-    return data_dir.exists() and any(p.name != BACKUPS_DIR for p in data_dir.iterdir())
+    """True if the data folder holds anything other than saved backups and the app's
+    own housekeeping files (see NOT_DATA)."""
+    return data_dir.exists() and any(p.name not in NOT_DATA for p in data_dir.iterdir())
 
 
 def _unique_path(path: Path) -> Path:
@@ -228,7 +232,7 @@ def restore_backup(archive: Path, data_dir: Path, *, overwrite: bool = False) ->
             )
             aside.mkdir()
             for item in list(data_dir.iterdir()):
-                if item.name in (BACKUPS_DIR, scratch.name):
+                if item.name in (*NOT_DATA, scratch.name):
                     continue
                 shutil.move(str(item), str(aside / item.name))
                 moved_aside.append((aside / item.name, item))

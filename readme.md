@@ -80,6 +80,9 @@ apply-spy/
 │   ├── sources/     # job source fetchers
 │   ├── matching/    # filters, embeddings, scoring
 │   ├── ui/          # local web UI
+│   ├── backup.py    # backup, restore and database self-check
+│   ├── launcher.py  # the macOS app icon (`apply-spy install-icon`)
+│   ├── config.py    # where the data lives
 │   └── cli.py
 ├── tests/
 ├── data/            # local DB and resumes (gitignored)

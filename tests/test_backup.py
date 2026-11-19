@@ -387,3 +387,33 @@ def test_cli_errors_are_friendly(tmp_path, monkeypatch, capsys):
     assert main(["check"]) == 1
     out = capsys.readouterr().out
     assert out.count("Error:") == 3
+
+
+def test_the_apps_own_housekeeping_files_do_not_count_as_data(tmp_path):
+    from apply_spy.backup import has_live_data
+
+    data = tmp_path / "data"
+    (data / ".nicegui").mkdir(parents=True)
+    (data / "backups").mkdir()
+    (data / "apply-spy.log").write_text("started", encoding="utf-8")
+    assert not has_live_data(data)
+
+    (data / "apply_spy.db").write_bytes(b"x")
+    assert has_live_data(data)
+
+
+def test_a_restore_leaves_the_housekeeping_files_where_they_are(tmp_path):
+    source = make_data_folder(tmp_path / "source")
+    archive, _ = create_backup(source)
+    target = make_data_folder(tmp_path / "target")
+    (target / ".nicegui").mkdir()
+    (target / ".nicegui" / "storage.json").write_text("{}", encoding="utf-8")
+    (target / "apply-spy.log").write_text("log", encoding="utf-8")
+
+    restore_backup(archive, target, overwrite=True)
+
+    assert (target / ".nicegui" / "storage.json").exists()
+    assert (target / "apply-spy.log").read_text(encoding="utf-8") == "log"
+    assert set(read_everything(target)) == {"Sample One", "Sample Two"}
+    [kept] = [p for p in tmp_path.iterdir() if p.name.startswith("target.before-restore-")]
+    assert not (kept / ".nicegui").exists()  # the old *data* moved aside, not these files
